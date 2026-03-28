@@ -1,0 +1,24 @@
+# NERO auto-enable daemon config
+# NOTE: usb_bus_info is required. Query it with:
+#   cd ../../vendor/pyAgxArm/pyAgxArm/scripts/ubuntu
+#   bash find_all_can_port.sh
+
+can_channel: can1
+can_bitrate: 1000000
+can_interface: socketcan
+
+# Required: bind to a fixed USB-CAN port to avoid wrong-device activation.
+# Example: "1-2:1.0"
+# USB candleLight on this machine is currently at 1-2.4:1.0.
+usb_bus_info: "1-2.4:1.0"
+
+can_scripts_dir: ../../vendor/pyAgxArm/pyAgxArm/scripts/ubuntu
+
+# Retry interval when recovering from CAN/robot failures.
+retry_interval_sec: 2.0
+
+# Maximum time to wait for full joint enable.
+enable_timeout_sec: 8.0
+
+# Health-check period after session is established.
+health_check_sec: 1.0

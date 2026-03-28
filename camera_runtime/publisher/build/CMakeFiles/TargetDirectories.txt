@@ -1,0 +1,3 @@
+/home/jetson/Desktop/集成测试/camera_runtime/publisher/build/CMakeFiles/dabai_frame_publisher.dir
+/home/jetson/Desktop/集成测试/camera_runtime/publisher/build/CMakeFiles/edit_cache.dir
+/home/jetson/Desktop/集成测试/camera_runtime/publisher/build/CMakeFiles/rebuild_cache.dir

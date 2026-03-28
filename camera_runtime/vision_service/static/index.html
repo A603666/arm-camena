@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DaBai Vision Dashboard</title>
+  <style>
+    :root {
+      --bg: #f3f6f8;
+      --card: #ffffff;
+      --ink: #1c2630;
+      --soft: #607080;
+      --ok: #1f9d55;
+      --warn: #d97706;
+      --line: #d7e0e8;
+      --brand: #0f766e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 300px at 20% -10%, #ccebe8 0%, transparent 60%),
+        radial-gradient(900px 240px at 95% 0%, #dae7f5 0%, transparent 60%),
+        var(--bg);
+    }
+    .page {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+    }
+    .header {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .title {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0.2px;
+    }
+    .sub {
+      margin: 4px 0 0;
+      color: var(--soft);
+      font-size: 14px;
+    }
+    .status {
+      font-size: 13px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #f7fbff;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1.5fr 1fr;
+      gap: 14px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .card h2 {
+      margin: 0 0 10px;
+      font-size: 17px;
+    }
+    .video {
+      width: 100%;
+      border-radius: 10px;
+      border: 1px solid #ccd8e3;
+      background: #0b1220;
+      display: block;
+    }
+    .kv {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px 12px;
+      align-items: center;
+      font-size: 14px;
+      margin-top: 8px;
+    }
+    .kv .k { color: var(--soft); }
+    .kv .v { font-weight: 600; }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    pre {
+      margin: 0;
+      max-height: 300px;
+      overflow: auto;
+      background: #0c1116;
+      color: #d9f3de;
+      padding: 10px;
+      border-radius: 8px;
+      font-size: 12px;
+    }
+    @media (max-width: 920px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div>
+        <h1 class="title">DaBai 相机视觉面板</h1>
+        <p class="sub">YOLO 推理 + 深度几何 + 抓取点输出（相机坐标系）</p>
+      </div>
+      <div id="healthBadge" class="status">连接中...</div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>标注视频流</h2>
+        <img id="stream" class="video" src="/stream/annotated" alt="annotated stream" />
+      </div>
+      <div class="card">
+        <h2>实时结果</h2>
+        <div class="kv">
+          <div class="k">状态</div><div id="status" class="v">-</div>
+          <div class="k">目标类别</div><div id="cls" class="v">-</div>
+          <div class="k">置信度</div><div id="conf" class="v">-</div>
+          <div class="k">中心深度</div><div id="centerDepth" class="v">-</div>
+          <div class="k">目标尺寸 L/W/H</div><div id="size" class="v">-</div>
+          <div class="k">抓取点 XYZ(mm)</div><div id="graspXyz" class="v">-</div>
+          <div class="k">抓取点 UV</div><div id="graspUv" class="v">-</div>
+          <div class="k">抓取角 yaw</div><div id="yaw" class="v">-</div>
+          <div class="k">方向状态</div><div id="axisState" class="v">-</div>
+          <div class="k">方向质量</div><div id="axisQuality" class="v">-</div>
+          <div class="k">FPS</div><div id="fps" class="v">-</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>原始 JSON</h2>
+      <pre id="raw">{}</pre>
+    </div>
+  </div>
+
+  <script>
+    const el = (id) => document.getElementById(id);
+
+    function fmt(n, digits = 2) {
+      if (n === null || n === undefined || Number.isNaN(n)) return "-";
+      return Number(n).toFixed(digits);
+    }
+
+    function updateView(data) {
+      const status = data?.status ?? "-";
+      el("status").textContent = status;
+      el("status").className = "v " + (status === "ok" ? "ok" : "warn");
+
+      el("cls").textContent = data?.target?.class_name ?? "-";
+      el("conf").textContent = data?.target?.conf != null ? fmt(data.target.conf, 3) : "-";
+      el("centerDepth").textContent = data?.depth?.center_depth_mm != null
+        ? `${fmt(data.depth.center_depth_mm, 1)} mm`
+        : "-";
+
+      if (data?.size) {
+        el("size").textContent = `${fmt(data.size.length_mm, 1)} / ${fmt(data.size.width_mm, 1)} / ${fmt(data.size.height_mm, 1)} mm`;
+      } else {
+        el("size").textContent = "-";
+      }
+
+      if (data?.grasp) {
+        el("graspXyz").textContent = `${fmt(data.grasp.x_mm, 1)}, ${fmt(data.grasp.y_mm, 1)}, ${fmt(data.grasp.z_mm, 1)}`;
+        el("graspUv").textContent = `${data.grasp.u ?? "-"}, ${data.grasp.v ?? "-"}`;
+        el("yaw").textContent = `${fmt(data.grasp.yaw_deg, 1)} deg`;
+        el("axisState").textContent = data.grasp.axis_state ?? "-";
+        el("axisQuality").textContent = data.grasp.axis_quality != null ? fmt(data.grasp.axis_quality, 3) : "-";
+      } else {
+        el("graspXyz").textContent = "-";
+        el("graspUv").textContent = "-";
+        el("yaw").textContent = "-";
+        el("axisState").textContent = "-";
+        el("axisQuality").textContent = "-";
+      }
+
+      el("fps").textContent = data?.timing?.fps != null ? fmt(data.timing.fps, 2) : "-";
+      el("raw").textContent = JSON.stringify(data ?? {}, null, 2);
+    }
+
+    async function refreshHealth() {
+      try {
+        const resp = await fetch("/api/health", { cache: "no-store" });
+        const h = await resp.json();
+        const ok = !!h.stream_connected;
+        el("healthBadge").textContent = ok ? "流已连接" : "等待相机流";
+        el("healthBadge").style.color = ok ? "#166534" : "#92400e";
+      } catch (_) {
+        el("healthBadge").textContent = "连接异常";
+      }
+    }
+
+    function connectWs() {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${location.host}/ws/vision`);
+      ws.onmessage = (evt) => {
+        try {
+          updateView(JSON.parse(evt.data));
+        } catch (_) {}
+      };
+      ws.onclose = () => setTimeout(connectWs, 1500);
+    }
+
+    connectWs();
+    refreshHealth();
+    setInterval(refreshHealth, 2000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+Log/
+
+# Large local model/assets not suitable for regular git history
+camera_runtime/yolo26n.pt
+模型文件/

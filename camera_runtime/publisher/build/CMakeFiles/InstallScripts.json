@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/jetson/Desktop/\u96c6\u6210\u6d4b\u8bd5/camera_runtime/publisher/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

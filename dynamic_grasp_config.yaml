@@ -1,0 +1,39 @@
+vision:
+  base_url: http://127.0.0.1:18000
+  poll_hz: 5.0
+  health_timeout_sec: 2.0
+  target_stable_frames: 3
+
+handeye:
+  mode: nominal
+  extrinsics_path: ./模型文件/nero_description/config/handeye_extrinsics.yaml
+
+scan:
+  max_offset_xy_m: 0.18
+  max_step_xy_m: 0.03
+  converge_tol_mm: 5.0
+  lost_target_timeout_sec: 1.0
+
+grasp:
+  open_width_m: 0.05
+  close_width_m: 0.0
+  force_n: 1.0
+  hover_clearance_m: 0.05
+  final_z_offset_m: 0.0
+  max_descent_m: 0.35
+  min_safe_z_m: 0.10
+  yaw_alignment_offset_deg: 0.0
+  verify_width_range_m: [0.003, 0.08]
+  verify_timeout_sec: 1.5
+
+route:
+  ready_from: threepoint.ready
+  transport_from: threepoint.transport
+  dump_from: threepoint.dump
+
+runtime:
+  arm_config_path: ./robot_runtime/config/default.yaml
+  speed_percent: 35
+  move_timeout_sec: 30.0
+  gripper_dwell_sec: 0.8
+  log_dir: ./logs

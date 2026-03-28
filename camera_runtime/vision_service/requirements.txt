@@ -1,0 +1,10 @@
+fastapi>=0.115.0
+uvicorn>=0.30.0
+# Keep NumPy 1.x to stay compatible with Ubuntu 22.04 system SciPy.
+numpy>=1.23,<1.25
+# OpenCV 4.12+ pulls NumPy 2.x; cap it to preserve the 1.x stack.
+opencv-python>=4.10,<4.12
+pyzmq>=26.0.0
+ultralytics>=8.4.0
+scikit-learn>=1.4.0
+pytest>=8.0.0
