@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import math
 import os
@@ -11,6 +12,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -246,6 +248,24 @@ class RealBackend:
     def _max_joint_error(cur: List[float], target: List[float]) -> float:
         return max(abs(cur[i] - target[i]) for i in range(7))
 
+    @staticmethod
+    def _angle_abs_diff_rad(a: float, b: float) -> float:
+        return abs(math.atan2(math.sin(float(a) - float(b)), math.cos(float(a) - float(b))))
+
+    @classmethod
+    def _pose_error(cls, cur: List[float], target: List[float]) -> Tuple[float, float]:
+        pos_err = math.sqrt(
+            (float(cur[0]) - float(target[0])) ** 2
+            + (float(cur[1]) - float(target[1])) ** 2
+            + (float(cur[2]) - float(target[2])) ** 2
+        )
+        rot_err = max(
+            cls._angle_abs_diff_rad(cur[3], target[3]),
+            cls._angle_abs_diff_rad(cur[4], target[4]),
+            cls._angle_abs_diff_rad(cur[5], target[5]),
+        )
+        return pos_err, rot_err
+
     def _wait_motion_done(
         self,
         timeout: float,
@@ -314,6 +334,82 @@ class RealBackend:
                 return True
             if last_progress_rad is not None and last_progress_rad >= min_progress_rad:
                 return True
+        return False
+
+    def _wait_pose_done(
+        self,
+        timeout: float,
+        target_pose: List[float],
+        start_pose: Optional[List[float]] = None,
+    ) -> bool:
+        if not self.robot:
+            return False
+
+        reach_mm = float(self.cfg.get("move_pose_reach_tolerance_mm", 5.0))
+        reach_deg = float(self.cfg.get("move_pose_reach_tolerance_deg", 5.0))
+        done_mm = float(self.cfg.get("move_pose_done_tolerance_mm", max(8.0, reach_mm * 1.8)))
+        done_deg = float(self.cfg.get("move_pose_done_tolerance_deg", max(8.0, reach_deg * 1.6)))
+        min_progress_m = float(self.cfg.get("move_pose_min_progress_m", 0.002))
+        min_progress_deg = float(self.cfg.get("move_pose_min_progress_deg", 1.0))
+        stable_cycles = int(max(1, self.cfg.get("move_reach_stable_cycles", 1)))
+
+        reach_m = max(0.0005, reach_mm / 1000.0)
+        done_m = max(reach_m, done_mm / 1000.0)
+        reach_rad = math.radians(max(0.1, reach_deg))
+        done_rad = math.radians(max(reach_deg, done_deg))
+        min_progress_rad = math.radians(max(0.0, min_progress_deg))
+
+        deadline = time.time() + timeout
+        stable_hits = 0
+        last_pos_err_m: Optional[float] = None
+        last_rot_err_rad: Optional[float] = None
+        last_pos_progress_m: Optional[float] = None
+        last_rot_progress_rad: Optional[float] = None
+
+        while time.time() < deadline:
+            status_done = False
+            try:
+                status = self.robot.get_arm_status()
+                if status is not None and hasattr(status, "msg"):
+                    motion_status = getattr(status.msg, "motion_status", None)
+                    status_done = motion_status == 0
+            except Exception:
+                pass
+
+            cur_pose = self.get_flange_pose()
+            if cur_pose is not None and len(cur_pose) == 6:
+                last_pos_err_m, last_rot_err_rad = self._pose_error(cur_pose, target_pose)
+                if start_pose is not None and len(start_pose) == 6:
+                    last_pos_progress_m, last_rot_progress_rad = self._pose_error(cur_pose, start_pose)
+
+                if last_pos_err_m <= reach_m and last_rot_err_rad <= reach_rad:
+                    stable_hits += 1
+                    if stable_hits >= stable_cycles:
+                        return True
+                else:
+                    stable_hits = 0
+
+                progress_ok = True
+                if start_pose is not None and len(start_pose) == 6:
+                    pos_progress_ok = (last_pos_progress_m or 0.0) >= min_progress_m
+                    rot_progress_ok = (last_rot_progress_rad or 0.0) >= min_progress_rad
+                    progress_ok = pos_progress_ok or rot_progress_ok
+
+                # Guard against false "done" by requiring pose convergence
+                # (or at least observable progress near target).
+                if status_done and last_pos_err_m <= done_m and last_rot_err_rad <= done_rad and progress_ok:
+                    return True
+
+            time.sleep(0.05)
+
+        if last_pos_err_m is not None and last_rot_err_rad is not None:
+            if last_pos_err_m <= done_m and last_rot_err_rad <= done_rad:
+                if start_pose is None:
+                    return True
+                pos_progress_ok = (last_pos_progress_m or 0.0) >= min_progress_m
+                rot_progress_ok = (last_rot_progress_rad or 0.0) >= min_progress_rad
+                if pos_progress_ok or rot_progress_ok:
+                    return True
         return False
 
     def get_joint_positions(self) -> Optional[List[float]]:
@@ -398,7 +494,7 @@ class RealBackend:
             timeout,
         )
 
-        start = self.get_joint_positions()
+        start_pose = self.get_flange_pose()
         try:
             getattr(self.robot, move_fn_name)(pose)
         except Exception as exc:
@@ -406,9 +502,17 @@ class RealBackend:
             self.logger.exception("%s exception for target_m_rad=%s", move_fn_name, [round(v, 6) for v in pose])
             return False
 
-        ok = self._wait_motion_done(timeout, target=None, start=start)
+        ok = self._wait_pose_done(timeout, target_pose=pose, start_pose=start_pose)
         if not ok and not self.last_move_error:
-            self.last_move_error = f"{move_fn_name} motion not settled within {timeout:.1f}s"
+            cur_pose = self.get_flange_pose()
+            if cur_pose is not None and len(cur_pose) == 6:
+                pos_err_m, rot_err_rad = self._pose_error(cur_pose, pose)
+                self.last_move_error = (
+                    f"{move_fn_name} motion not settled within {timeout:.1f}s "
+                    f"(pos_err={pos_err_m * 1000.0:.1f}mm, rot_err={math.degrees(rot_err_rad):.2f}deg)"
+                )
+            else:
+                self.last_move_error = f"{move_fn_name} motion not settled within {timeout:.1f}s (no flange feedback)"
         if not ok:
             self.logger.error("move_pose_%s failed: %s", mode, self.last_move_error)
         return ok
@@ -545,6 +649,12 @@ class NeroArmTester:
         self.backend = RealBackend(self.cfg, self.logger)
         self.threepoint_info: Dict[str, Dict[str, List[float]]] = {}
         self._sync_threepoint_points()
+        self.feedback_csv_interval_sec = self._resolve_feedback_csv_interval()
+        self.feedback_csv_path: Optional[Path] = None
+        self._feedback_csv_file = None
+        self._feedback_csv_writer = None
+        self._feedback_csv_thread: Optional[threading.Thread] = None
+        self._feedback_csv_stop = threading.Event()
 
     @staticmethod
     def _load_cfg(path: Path) -> dict:
@@ -577,6 +687,168 @@ class NeroArmTester:
         if candidate.is_absolute():
             return candidate
         return Path(__file__).resolve().parent / candidate
+
+    def _resolve_feedback_csv_interval(self) -> float:
+        cfg = self.cfg.get("logging", {}) if isinstance(self.cfg.get("logging", {}), dict) else {}
+        raw = cfg.get("feedback_csv_interval_sec", 5.0)
+        try:
+            interval = float(raw)
+        except Exception:
+            interval = 5.0
+        return max(1.0, interval)
+
+    def _resolve_feedback_csv_path(self) -> Path:
+        if self.log_path is not None:
+            return self.log_path.with_name(f"{self.log_path.stem}_feedback.csv")
+
+        cfg = self.cfg.get("logging", {}) if isinstance(self.cfg.get("logging", {}), dict) else {}
+        log_dir = self._resolve_log_dir(str(cfg.get("dir", "./logs")))
+        prefix = str(cfg.get("filename_prefix", "nero_test")).strip() or "nero_test"
+        run_id = time.strftime("%Y%m%d_%H%M%S") + f"_pid{os.getpid()}"
+        return log_dir / f"{prefix}_{run_id}_feedback.csv"
+
+    @staticmethod
+    def _feedback_csv_header() -> List[str]:
+        return [
+            "timestamp_iso",
+            "timestamp_unix_sec",
+            "joint1_rad",
+            "joint2_rad",
+            "joint3_rad",
+            "joint4_rad",
+            "joint5_rad",
+            "joint6_rad",
+            "joint7_rad",
+            "joint1_deg",
+            "joint2_deg",
+            "joint3_deg",
+            "joint4_deg",
+            "joint5_deg",
+            "joint6_deg",
+            "joint7_deg",
+            "flange_x",
+            "flange_y",
+            "flange_z",
+            "flange_rx",
+            "flange_ry",
+            "flange_rz",
+            "connected",
+            "joint_feedback_alive",
+            "joint_enable_flags",
+            "effector",
+            "sample_error",
+        ]
+
+    @staticmethod
+    def _format_float(value: Optional[float], precision: int = 6) -> str:
+        if value is None:
+            return ""
+        return f"{float(value):.{precision}f}"
+
+    def _collect_feedback_csv_row(self, ts: float) -> List[str]:
+        joints: Optional[List[float]] = None
+        pose: Optional[List[float]] = None
+        sample_error = ""
+
+        try:
+            joints = self.backend.get_joint_positions()
+        except Exception as exc:
+            sample_error = f"joint_feedback_error:{exc}"
+
+        try:
+            pose = self.backend.get_flange_pose()
+        except Exception as exc:
+            if sample_error:
+                sample_error += ";"
+            sample_error += f"flange_feedback_error:{exc}"
+
+        joint_rad = joints if joints is not None and len(joints) == 7 else [None] * 7
+        joint_deg = [math.degrees(v) if v is not None else None for v in joint_rad]
+        flange = pose if pose is not None and len(pose) == 6 else [None] * 6
+        diag = self.backend.diagnostics()
+
+        iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) + f".{int((ts % 1) * 1000):03d}"
+        row = [
+            iso,
+            self._format_float(ts, precision=3),
+            *(self._format_float(v) for v in joint_rad),
+            *(self._format_float(v, precision=3) for v in joint_deg),
+            *(self._format_float(v) for v in flange),
+            str(diag.get("connected", "")),
+            str(diag.get("joint_feedback_alive", "")),
+            str(diag.get("joint_enable_flags", "")),
+            str(diag.get("effector", "")),
+            sample_error,
+        ]
+        return row
+
+    def _feedback_csv_loop(self) -> None:
+        while not self._feedback_csv_stop.wait(self.feedback_csv_interval_sec):
+            if self._feedback_csv_writer is None or self._feedback_csv_file is None:
+                continue
+            try:
+                self._feedback_csv_writer.writerow(self._collect_feedback_csv_row(time.time()))
+                self._feedback_csv_file.flush()
+            except Exception as exc:
+                self.logger.warning("feedback csv write failed: %s", exc)
+
+    def _start_feedback_csv_logger(self) -> None:
+        if self._feedback_csv_thread is not None:
+            return
+        try:
+            path = self._resolve_feedback_csv_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            need_header = (not path.exists()) or path.stat().st_size == 0
+
+            self._feedback_csv_file = path.open("a", encoding="utf-8", newline="")
+            self._feedback_csv_writer = csv.writer(self._feedback_csv_file)
+            if need_header:
+                self._feedback_csv_writer.writerow(self._feedback_csv_header())
+            # Write one initial sample immediately, then continue on interval.
+            self._feedback_csv_writer.writerow(self._collect_feedback_csv_row(time.time()))
+            self._feedback_csv_file.flush()
+
+            self.feedback_csv_path = path
+            self._feedback_csv_stop.clear()
+            self._feedback_csv_thread = threading.Thread(
+                target=self._feedback_csv_loop,
+                name="nero_feedback_csv",
+                daemon=True,
+            )
+            self._feedback_csv_thread.start()
+            self.logger.info(
+                "feedback csv logger started file=%s interval_sec=%.1f",
+                path,
+                self.feedback_csv_interval_sec,
+            )
+        except Exception as exc:
+            self.feedback_csv_path = None
+            self._feedback_csv_thread = None
+            self._feedback_csv_writer = None
+            if self._feedback_csv_file is not None:
+                try:
+                    self._feedback_csv_file.close()
+                except Exception:
+                    pass
+                self._feedback_csv_file = None
+            self.logger.warning("failed to start feedback csv logger: %s", exc)
+
+    def _stop_feedback_csv_logger(self) -> None:
+        self._feedback_csv_stop.set()
+        if self._feedback_csv_thread is not None:
+            try:
+                self._feedback_csv_thread.join(timeout=max(1.0, self.feedback_csv_interval_sec + 0.5))
+            except Exception:
+                pass
+            self._feedback_csv_thread = None
+        self._feedback_csv_writer = None
+        if self._feedback_csv_file is not None:
+            try:
+                self._feedback_csv_file.flush()
+                self._feedback_csv_file.close()
+            except Exception:
+                pass
+            self._feedback_csv_file = None
 
     def _cleanup_old_logs(self, log_dir: Path, prefix: str, retain_runs: int) -> None:
         if retain_runs <= 0:
@@ -664,6 +936,10 @@ class NeroArmTester:
     def shutdown(self) -> None:
         try:
             self.store.save()
+        except Exception:
+            pass
+        try:
+            self._stop_feedback_csv_logger()
         except Exception:
             pass
         try:
@@ -1480,10 +1756,13 @@ class NeroArmTester:
             return 1
 
         self.backend.set_speed_percent(self.speed_percent)
+        self._start_feedback_csv_logger()
 
         print("NERO real-arm tester started")
         print("backend=real")
         print("config=", self.cfg_path)
+        if self.feedback_csv_path is not None:
+            print(f"feedback_csv_file={self.feedback_csv_path}")
         self._print_help()
         self.logger.info("cli started backend=real config=%s", self.cfg_path)
 
@@ -1583,6 +1862,9 @@ class NeroArmTester:
                     hint = self._suggest_command(raw, tokens)
                     if hint:
                         print(f"[HINT] {hint}")
+            except KeyboardInterrupt:
+                print("\n[ABORT] command interrupted by Ctrl+C")
+                self.logger.warning("command interrupted by keyboard raw=%r tokens=%r", raw, tokens)
             except Exception as exc:
                 print(f"[ERR] {exc}")
                 self.logger.exception("command failed raw=%r tokens=%r", raw, tokens)

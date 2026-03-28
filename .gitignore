@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 Log/
+robot_runtime/logs/
 
 # Large local model/assets not suitable for regular git history
 camera_runtime/yolo26n.pt

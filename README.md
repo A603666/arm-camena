@@ -26,7 +26,7 @@
 
 关键安全约束：
 
-- 关节 7 必须满足 **`J7 > 30°`**（严格大于，`=30°` 视为不通过）。
+- 关节 7 必须满足 **`J7 > 10°`**（严格大于，`=10°` 视为不通过）。
 - 该约束在“点位加载时”和“运行时关键运动后”都会检查。
 
 ---
@@ -112,8 +112,8 @@ sudo udevadm trigger
 
 - `strict_down_enabled: false`
   - 默认不锁死 `pick` 姿态，降低奇异解/无解风险
-- `min_joint7_deg: 30.0`
-  - 严格执行 `J7 > 30°`
+- `min_joint7_deg: 10.0`
+  - 严格执行 `J7 > 10°`
 - 四个示教点：`ready/pick/transport/dump`
   - 均包含 `joints_deg` 与 `pose_mm_deg`
   - 已写入你最新示教数据
@@ -187,7 +187,7 @@ python3 robot_runtime/nero_test_cli.py --config robot_runtime/config/default.yam
 常用命令：
 
 - `status`：查看关节与法兰反馈
-- `precheck`：运行前检查（包含点位完整性与 `J7 > 30°` 校验）
+- `precheck`：运行前检查（包含点位完整性与 `J7 > 10°` 校验）
 - `show points`：打印四点位参数
 - `run threepoint step`：四点位分步执行
 - `run threepoint auto`：四点位自动执行
@@ -205,7 +205,7 @@ python3 robot_runtime/nero_test_cli.py --config robot_runtime/config/default.yam
 系统内置安全机制：
 
 - 每次运动前检查会话健康（使能状态、反馈活性）
-- 关键运动后检查 `J7 > 30°`
+- 关键运动后检查 `J7 > 10°`
 - 动态抓取失败时自动执行回退到 `ready`
 - 键盘中断时执行 `estop + recover`（如驱动支持）
 
@@ -269,7 +269,7 @@ USB-CAN 不匹配：
 `J7` 校验失败：
 
 - 程序日志会标出当前 `J7` 实测角度
-- 若小于等于 30°，需重新示教该点位，确保 `J7 > 30°`
+- 若小于等于 10°，需重新示教该点位，确保 `J7 > 10°`
 
 ---
 

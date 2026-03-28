@@ -1,7 +1,7 @@
 backend: real
 
 # Real arm CAN connection (official pyAgxArm SDK)
-can_channel: can0
+can_channel: can1
 can_interface: socketcan
 can_bitrate: 1000000
 pyagxarm_repo: ../../vendor/pyAgxArm
@@ -29,6 +29,7 @@ logging:
   capture_stdout: true
   capture_stderr: true
   log_commands: true
+  feedback_csv_interval_sec: 5.0
 
 # Motion safety
 speed_percent: 50
@@ -72,9 +73,9 @@ threepoint:
   strict_down_enabled: false
   lock_orientation_from: pick
   transfer_motion: p
-  approach_motion: l
+  approach_motion: p
   orientation_tolerance_deg: 5.0
-  min_joint7_deg: 30.0
+  min_joint7_deg: 10.0
 
   overwrite_waypoints_on_start: true
 
