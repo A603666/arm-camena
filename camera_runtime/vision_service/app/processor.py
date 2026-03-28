@@ -1,26 +1,24 @@
 from __future__ import annotations
 
+import copy
+import logging
 import threading
 import time
 from typing import Any
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
+from ultralytics.models.yolo.model import YOLO
 
 from .config import AppConfig
 from .geometry import (
     axis_dir_to_yaw_deg,
-    depth_roi_to_points,
-    estimate_object_geometry,
     extract_support_region,
-    find_grasp_point,
     fit_ground_plane,
     median_depth_at,
     project_xyz_to_uv,
-    reproject_geometry_to_axis,
-    select_main_cluster,
 )
+from .geometry_backend import CPUReferenceBackend, GeometryBackend, build_geometry_backend
 from .receiver import ZmqFrameReceiver
 from .state import SharedState
 from .types import FramePacket
@@ -28,6 +26,7 @@ from .types import FramePacket
 
 class VisionProcessor:
     def __init__(self, config: AppConfig, state: SharedState) -> None:
+        self._logger = logging.getLogger(self.__class__.__name__)
         self._cfg = config
         self._state = state
         self._receiver = ZmqFrameReceiver(
@@ -36,6 +35,10 @@ class VisionProcessor:
             timeout_ms=config.zmq_timeout_ms,
         )
         self._model = YOLO(str(config.model_path))
+        self._is_engine_model = config.model_path.suffix.lower() == ".engine"
+        self._predict_supports_half = not self._is_engine_model
+        if self._is_engine_model:
+            self._logger.info("YOLO TensorRT engine detected: %s", config.model_path)
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, name="vision-processor", daemon=True)
         self._fps = 0.0
@@ -45,7 +48,26 @@ class VisionProcessor:
         self._cached_geometry_payload: dict[str, Any] | None = None
         self._cached_geometry_bbox: list[int] | None = None
         self._cached_geometry_class_id: int | None = None
+        self._cached_geometry_backend: str | None = None
         self._axis_tracker: dict[str, Any] | None = None
+        self._cpu_geometry_backend: GeometryBackend = CPUReferenceBackend()
+        self._geometry_backend, selection = build_geometry_backend(
+            requested_backend=self._cfg.geom_backend,
+            yolo_device=self._cfg.yolo_device,
+        )
+        self._geometry_force_cpu = False
+        self._geometry_fallback_count = 0
+        self._geometry_parity_mismatch_count = 0
+
+        self._enable_cuda_benchmark()
+        self._warmup_yolo_if_needed()
+        self._logger.info(
+            "geometry backend requested=%s resolved=%s torch_cuda=%s cuml=%s",
+            selection.requested,
+            selection.resolved,
+            selection.torch_cuda_available,
+            selection.cuml_available,
+        )
 
     def start(self) -> None:
         self._thread.start()
@@ -54,6 +76,64 @@ class VisionProcessor:
         self._stop_event.set()
         self._thread.join(timeout=2.0)
         self._receiver.close()
+
+    def _enable_cuda_benchmark(self) -> None:
+        if "cuda" not in self._cfg.yolo_device.lower():
+            return
+        try:
+            import torch
+
+            torch.backends.cudnn.benchmark = True
+        except Exception as exc:
+            self._logger.warning("unable to enable cudnn benchmark: %s", exc)
+
+    def _use_fp16_infer(self) -> bool:
+        return self._cfg.yolo_precision == "fp16" and ("cuda" in self._cfg.yolo_device.lower())
+
+    def _warmup_yolo_if_needed(self) -> None:
+        if not self._cfg.yolo_warmup:
+            return
+        warmup_size = max(64, min(1280, int(self._cfg.yolo_imgsz)))
+        warmup_frame = np.zeros((warmup_size, warmup_size, 3), dtype=np.uint8)
+        base_kwargs: dict[str, Any] = {
+            "source": warmup_frame,
+            "conf": self._cfg.yolo_conf,
+            "imgsz": self._cfg.yolo_imgsz,
+            "device": self._cfg.yolo_device,
+            "max_det": 1,
+            "verbose": False,
+        }
+        try:
+            if self._predict_supports_half:
+                half_kwargs = dict(base_kwargs)
+                half_kwargs["half"] = self._use_fp16_infer()
+                try:
+                    self._model.predict(**half_kwargs)
+                    self._logger.info(
+                        "YOLO warmup done (device=%s, precision=%s)",
+                        self._cfg.yolo_device,
+                        self._cfg.yolo_precision,
+                    )
+                except TypeError:
+                    self._predict_supports_half = False
+                    self._model.predict(**base_kwargs)
+                    self._logger.info(
+                        "YOLO warmup done (device=%s, precision=fp32, half-arg unsupported)",
+                        self._cfg.yolo_device,
+                    )
+            else:
+                self._model.predict(**base_kwargs)
+                if self._is_engine_model:
+                    self._logger.info("YOLO warmup done (device=%s, precision=engine)", self._cfg.yolo_device)
+                else:
+                    self._logger.info("YOLO warmup done (device=%s, precision=fp32)", self._cfg.yolo_device)
+        except Exception as exc:
+            self._logger.warning("YOLO warmup failed: %s", exc)
+
+    def _runtime_geometry_backend(self) -> GeometryBackend:
+        if self._geometry_force_cpu:
+            return self._cpu_geometry_backend
+        return self._geometry_backend
 
     def _update_fps(self, now: float) -> float:
         if self._prev_frame_time is None:
@@ -104,7 +184,11 @@ class VisionProcessor:
         self._frame_index += 1
         run_infer = (self._frame_index % self._cfg.infer_every_n == 0) or (not self._cached_detections)
         if run_infer:
+            infer_start = time.perf_counter()
             self._cached_detections = self._infer(rgb)
+            infer_ms = (time.perf_counter() - infer_start) * 1000.0
+        else:
+            infer_ms = None
         detections = self._cached_detections
         selected = self._select_target(detections, w, h)
 
@@ -122,6 +206,17 @@ class VisionProcessor:
                 "infer_ran": bool(run_infer),
                 "geometry_ran": False,
                 "geometry_reused": False,
+                "infer_ms": None if infer_ms is None else round(float(infer_ms), 2),
+                "geometry_backend": None,
+                "geometry_total_ms": None,
+                "geometry_depth_to_points_ms": None,
+                "geometry_ground_fit_ms": None,
+                "geometry_support_ms": None,
+                "geometry_cluster_ms": None,
+                "geometry_pca_ms": None,
+                "geometry_grasp_ms": None,
+                "geometry_fallback_count": int(self._geometry_fallback_count),
+                "geometry_parity_mismatch_count": int(self._geometry_parity_mismatch_count),
             },
         }
 
@@ -176,7 +271,7 @@ class VisionProcessor:
         result["timing"]["geometry_reused"] = bool(not run_geometry)
 
         if run_geometry:
-            geometry_payload = self._compute_geometry_payload(
+            geometry_payload, geometry_timing, backend_used = self._run_geometry_with_fallback(
                 depth=depth,
                 bbox=bbox,
                 class_id=class_id,
@@ -190,8 +285,20 @@ class VisionProcessor:
             self._cached_geometry_payload = geometry_payload
             self._cached_geometry_bbox = [int(v) for v in bbox]
             self._cached_geometry_class_id = class_id
+            self._cached_geometry_backend = backend_used
+            result["timing"]["geometry_backend"] = backend_used
+            result["timing"]["geometry_total_ms"] = round(float(geometry_timing.get("total_ms", 0.0)), 2)
+            result["timing"]["geometry_depth_to_points_ms"] = round(float(geometry_timing.get("depth_to_points_ms", 0.0)), 2)
+            result["timing"]["geometry_ground_fit_ms"] = round(float(geometry_timing.get("ground_fit_ms", 0.0)), 2)
+            result["timing"]["geometry_support_ms"] = round(float(geometry_timing.get("support_ms", 0.0)), 2)
+            result["timing"]["geometry_cluster_ms"] = round(float(geometry_timing.get("cluster_ms", 0.0)), 2)
+            result["timing"]["geometry_pca_ms"] = round(float(geometry_timing.get("pca_ms", 0.0)), 2)
+            result["timing"]["geometry_grasp_ms"] = round(float(geometry_timing.get("grasp_ms", 0.0)), 2)
+            result["timing"]["geometry_fallback_count"] = int(self._geometry_fallback_count)
+            result["timing"]["geometry_parity_mismatch_count"] = int(self._geometry_parity_mismatch_count)
         else:
             geometry_payload = self._cached_geometry_payload or self._make_geometry_payload(status="invalid_depth", size=None, grasp=None)
+            result["timing"]["geometry_backend"] = self._cached_geometry_backend
 
         result["status"] = str(geometry_payload["status"])
         result["size"] = self._clone_optional_dict(geometry_payload["size"])
@@ -213,6 +320,136 @@ class VisionProcessor:
         )
         return result, self._encode_annotated(annotated)
 
+    def _run_geometry_with_fallback(
+        self,
+        depth: np.ndarray,
+        bbox: list[int],
+        class_id: int,
+        depth_scale: float,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        ref_uv: tuple[int, int],
+    ) -> tuple[dict[str, Any], dict[str, float], str]:
+        backend = self._runtime_geometry_backend()
+        backend_name = backend.name
+        if self._geometry_force_cpu and backend_name == "cpu" and self._geometry_backend.name != "cpu":
+            backend_name = "cpu_forced"
+
+        axis_tracker_before = copy.deepcopy(self._axis_tracker)
+        try:
+            payload, timing = self._compute_geometry_payload(
+                depth=depth,
+                bbox=bbox,
+                class_id=class_id,
+                depth_scale=depth_scale,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                ref_uv=ref_uv,
+                backend=backend,
+            )
+        except Exception as exc:
+            self._logger.warning("geometry backend %s failed, fallback to cpu: %s", backend_name, exc)
+            self._axis_tracker = axis_tracker_before
+            payload, timing = self._compute_geometry_payload(
+                depth=depth,
+                bbox=bbox,
+                class_id=class_id,
+                depth_scale=depth_scale,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                ref_uv=ref_uv,
+                backend=self._cpu_geometry_backend,
+            )
+            self._geometry_fallback_count += 1
+            return payload, timing, "cpu_fallback"
+
+        should_check_parity = (
+            self._cfg.geom_parity_check
+            and backend.name != "cpu"
+            and (self._frame_index % max(1, self._cfg.geom_parity_every_n) == 0)
+        )
+        if not should_check_parity:
+            return payload, timing, backend_name
+
+        axis_tracker_after_primary = copy.deepcopy(self._axis_tracker)
+        try:
+            self._axis_tracker = copy.deepcopy(axis_tracker_before)
+            cpu_payload, cpu_timing = self._compute_geometry_payload(
+                depth=depth,
+                bbox=bbox,
+                class_id=class_id,
+                depth_scale=depth_scale,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                ref_uv=ref_uv,
+                backend=self._cpu_geometry_backend,
+            )
+            axis_tracker_after_cpu = copy.deepcopy(self._axis_tracker)
+        except Exception as exc:
+            self._axis_tracker = axis_tracker_after_primary
+            self._logger.warning("geometry parity CPU check failed: %s", exc)
+            return payload, timing, backend_name
+
+        parity_ok, reason = self._geometry_payload_within_threshold(payload, cpu_payload)
+        if parity_ok:
+            self._axis_tracker = axis_tracker_after_primary
+            return payload, timing, backend_name
+
+        self._geometry_parity_mismatch_count += 1
+        self._geometry_fallback_count += 1
+        self._geometry_force_cpu = True
+        self._axis_tracker = axis_tracker_after_cpu
+        self._logger.warning("geometry parity mismatch, force cpu backend: %s", reason)
+        return cpu_payload, cpu_timing, "cpu_forced_parity"
+
+    @staticmethod
+    def _yaw_delta_deg(lhs: float, rhs: float) -> float:
+        raw = abs(float(lhs) - float(rhs)) % 360.0
+        return min(raw, 360.0 - raw)
+
+    @classmethod
+    def _geometry_payload_within_threshold(
+        cls,
+        lhs: dict[str, Any],
+        rhs: dict[str, Any],
+    ) -> tuple[bool, str]:
+        lhs_status = str(lhs.get("status", ""))
+        rhs_status = str(rhs.get("status", ""))
+        if lhs_status != rhs_status:
+            return False, f"status mismatch {lhs_status} != {rhs_status}"
+        if lhs_status != "ok":
+            return True, "status not ok"
+
+        lhs_size = lhs.get("size")
+        rhs_size = rhs.get("size")
+        if bool(lhs_size) != bool(rhs_size):
+            return False, "size presence mismatch"
+        if lhs_size and rhs_size:
+            for key in ("length_mm", "width_mm", "height_mm"):
+                if abs(float(lhs_size.get(key, 0.0)) - float(rhs_size.get(key, 0.0))) > 3.0:
+                    return False, f"size mismatch on {key}"
+
+        lhs_grasp = lhs.get("grasp")
+        rhs_grasp = rhs.get("grasp")
+        if bool(lhs_grasp) != bool(rhs_grasp):
+            return False, "grasp presence mismatch"
+        if lhs_grasp and rhs_grasp:
+            for key in ("x_mm", "y_mm", "z_mm"):
+                if abs(float(lhs_grasp.get(key, 0.0)) - float(rhs_grasp.get(key, 0.0))) > 2.0:
+                    return False, f"grasp mismatch on {key}"
+            yaw_delta = cls._yaw_delta_deg(float(lhs_grasp.get("yaw_deg", 0.0)), float(rhs_grasp.get("yaw_deg", 0.0)))
+            if yaw_delta > 2.0:
+                return False, "grasp yaw mismatch"
+        return True, "within-threshold"
+
     def _compute_geometry_payload(
         self,
         depth: np.ndarray,
@@ -224,10 +461,27 @@ class VisionProcessor:
         cx: float,
         cy: float,
         ref_uv: tuple[int, int],
-    ) -> dict[str, Any]:
+        backend: GeometryBackend,
+    ) -> tuple[dict[str, Any], dict[str, float]]:
+        overall_start = time.perf_counter()
+        timings: dict[str, float] = {
+            "depth_to_points_ms": 0.0,
+            "ground_fit_ms": 0.0,
+            "support_ms": 0.0,
+            "cluster_ms": 0.0,
+            "pca_ms": 0.0,
+            "grasp_ms": 0.0,
+            "total_ms": 0.0,
+        }
+
+        def finish(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, float]]:
+            timings["total_ms"] = (time.perf_counter() - overall_start) * 1000.0
+            return payload, timings
+
         h, w = depth.shape[:2]
         x1, y1, x2, y2 = self._clamp_bbox(bbox, w, h)
-        points, uv = depth_roi_to_points(
+        t = time.perf_counter()
+        points, uv = backend.depth_roi_to_points(
             depth=depth,
             bbox_xyxy=(x1, y1, x2, y2),
             depth_scale=depth_scale,
@@ -238,6 +492,8 @@ class VisionProcessor:
             min_depth_mm=self._cfg.min_depth_mm,
             max_depth_mm=self._cfg.max_depth_mm,
         )
+        timings["depth_to_points_ms"] = (time.perf_counter() - t) * 1000.0
+
         segmentation: dict[str, Any] = {
             "input_points": int(points.shape[0]),
             "ground_points": 0,
@@ -251,7 +507,15 @@ class VisionProcessor:
             "axis_eig_ratio": None,
         }
         if points.shape[0] < self._cfg.min_object_points:
-            return self._make_geometry_payload(status="invalid_depth", size=None, grasp=None, segmentation=segmentation, visualization=None)
+            return finish(
+                self._make_geometry_payload(
+                    status="invalid_depth",
+                    size=None,
+                    grasp=None,
+                    segmentation=segmentation,
+                    visualization=None,
+                )
+            )
 
         if points.shape[0] > self._cfg.max_points_for_geometry:
             stride = max(1, (points.shape[0] + self._cfg.max_points_for_geometry - 1) // self._cfg.max_points_for_geometry)
@@ -260,11 +524,14 @@ class VisionProcessor:
             segmentation["input_points"] = int(points.shape[0])
             segmentation["non_ground_points"] = int(points.shape[0])
 
+        t = time.perf_counter()
         ground_plane = fit_ground_plane(
             points,
             residual_mm=self._cfg.ransac_residual_mm,
             max_trials=self._cfg.ransac_max_trials,
         )
+        timings["ground_fit_ms"] = (time.perf_counter() - t) * 1000.0
+
         ground_mask = np.zeros(points.shape[0], dtype=bool) if ground_plane is None else ground_plane.inlier_mask.astype(bool)
         ground_count = int(np.count_nonzero(ground_mask))
         non_ground_count = int(points.shape[0] - ground_count)
@@ -291,6 +558,7 @@ class VisionProcessor:
         }
 
         if ground_plane is not None:
+            t = time.perf_counter()
             support_region = extract_support_region(
                 points=points,
                 uv=uv,
@@ -301,6 +569,7 @@ class VisionProcessor:
                 close_px=self._cfg.support_close_px,
                 min_area_px=max(12, (self._cfg.support_close_px * self._cfg.support_close_px) // 2),
             )
+            timings["support_ms"] = (time.perf_counter() - t) * 1000.0
             if support_region is not None and support_region["selected_points"].shape[0] >= self._cfg.min_object_points:
                 main_points = support_region["selected_points"]
                 main_uv = support_region["selected_uv"]
@@ -308,13 +577,15 @@ class VisionProcessor:
                 support_source = "support_region"
 
         if support_source != "support_region":
-            cluster_mask = select_main_cluster(
+            t = time.perf_counter()
+            cluster_mask = backend.select_main_cluster(
                 points=object_points,
                 uv=object_uv,
                 ref_uv=(float(ref_uv[0]), float(ref_uv[1])),
                 eps_mm=self._cfg.dbscan_eps_mm,
                 min_samples=self._cfg.dbscan_min_samples,
             )
+            timings["cluster_ms"] = (time.perf_counter() - t) * 1000.0
             main_points = object_points[cluster_mask]
             main_uv = object_uv[cluster_mask]
             support_stats = {
@@ -334,24 +605,30 @@ class VisionProcessor:
         visualization["support_source"] = support_source
 
         if main_points.shape[0] < self._cfg.min_object_points:
-            return self._make_geometry_payload(
-                status="invalid_depth",
-                size=None,
-                grasp=None,
-                segmentation=segmentation,
-                visualization=visualization,
+            return finish(
+                self._make_geometry_payload(
+                    status="invalid_depth",
+                    size=None,
+                    grasp=None,
+                    segmentation=segmentation,
+                    visualization=visualization,
+                )
             )
 
-        geometry = estimate_object_geometry(main_points, plane=ground_plane)
+        t = time.perf_counter()
+        geometry = backend.estimate_object_geometry(main_points, plane=ground_plane)
         if geometry is None:
-            geometry = estimate_object_geometry(main_points)
+            geometry = backend.estimate_object_geometry(main_points)
         if geometry is None:
-            return self._make_geometry_payload(
-                status="invalid_depth",
-                size=None,
-                grasp=None,
-                segmentation=segmentation,
-                visualization=visualization,
+            timings["pca_ms"] = (time.perf_counter() - t) * 1000.0
+            return finish(
+                self._make_geometry_payload(
+                    status="invalid_depth",
+                    size=None,
+                    grasp=None,
+                    segmentation=segmentation,
+                    visualization=visualization,
+                )
             )
 
         axis_quality = self._score_axis_quality(
@@ -374,7 +651,8 @@ class VisionProcessor:
         )
         if stable_axis_dir_cam is None:
             stable_axis_dir_cam = np.asarray(geometry["major_axis_cam"], dtype=np.float32)
-        geometry_for_grasp = reproject_geometry_to_axis(main_points, geometry, stable_axis_dir_cam) or geometry
+        geometry_for_grasp = backend.reproject_geometry_to_axis(main_points, geometry, stable_axis_dir_cam) or geometry
+        timings["pca_ms"] = (time.perf_counter() - t) * 1000.0
         segmentation["axis_eig_ratio"] = round(float(geometry["axis_eig_ratio"]), 4)
 
         center_xyz = geometry["center_xyz_mm"]
@@ -410,7 +688,8 @@ class VisionProcessor:
             "height_mm": round(float(geometry["height_mm"]), 2),
         }
 
-        grasp = find_grasp_point(
+        t = time.perf_counter()
+        grasp = backend.find_grasp_point(
             points=main_points,
             geometry=geometry_for_grasp,
             width_limit_mm=self._cfg.gripper_width_limit_mm,
@@ -418,13 +697,16 @@ class VisionProcessor:
             step_mm=self._cfg.grasp_window_step_mm,
             min_points=self._cfg.grasp_window_min_points,
         )
+        timings["grasp_ms"] = (time.perf_counter() - t) * 1000.0
         if grasp["status"] != "ok":
-            return self._make_geometry_payload(
-                status="too_wide",
-                size=size,
-                grasp=None,
-                segmentation=segmentation,
-                visualization=visualization,
+            return finish(
+                self._make_geometry_payload(
+                    status="too_wide",
+                    size=size,
+                    grasp=None,
+                    segmentation=segmentation,
+                    visualization=visualization,
+                )
             )
 
         grasp_xyz = grasp["grasp_xyz_mm"]
@@ -441,12 +723,14 @@ class VisionProcessor:
             "axis_quality": round(float(axis_quality_out), 3),
             "axis_state": axis_state,
         }
-        return self._make_geometry_payload(
-            status="ok",
-            size=size,
-            grasp=grasp_result,
-            segmentation=segmentation,
-            visualization=visualization,
+        return finish(
+            self._make_geometry_payload(
+                status="ok",
+                size=size,
+                grasp=grasp_result,
+                segmentation=segmentation,
+                visualization=visualization,
+            )
         )
 
     def _should_run_geometry(self, class_id: int, bbox: list[int]) -> bool:
@@ -466,6 +750,7 @@ class VisionProcessor:
         self._cached_geometry_payload = None
         self._cached_geometry_bbox = None
         self._cached_geometry_class_id = None
+        self._cached_geometry_backend = None
 
     def _clear_axis_tracker(self) -> None:
         self._axis_tracker = None
@@ -614,14 +899,24 @@ class VisionProcessor:
             cv2.circle(image, p2, 4, (0, 255, 255), -1)
 
     def _infer(self, image_bgr: np.ndarray) -> list[dict[str, Any]]:
-        pred = self._model.predict(
-            source=image_bgr,
-            conf=self._cfg.yolo_conf,
-            imgsz=self._cfg.yolo_imgsz,
-            device=self._cfg.yolo_device,
-            max_det=20,
-            verbose=False,
-        )[0]
+        predict_kwargs: dict[str, Any] = {
+            "source": image_bgr,
+            "conf": self._cfg.yolo_conf,
+            "imgsz": self._cfg.yolo_imgsz,
+            "device": self._cfg.yolo_device,
+            "max_det": 20,
+            "verbose": False,
+        }
+        if self._predict_supports_half:
+            predict_kwargs_with_half = dict(predict_kwargs)
+            predict_kwargs_with_half["half"] = self._use_fp16_infer()
+            try:
+                pred = self._model.predict(**predict_kwargs_with_half)[0]
+            except TypeError:
+                self._predict_supports_half = False
+                pred = self._model.predict(**predict_kwargs)[0]
+        else:
+            pred = self._model.predict(**predict_kwargs)[0]
 
         detections: list[dict[str, Any]] = []
         names = pred.names if isinstance(pred.names, dict) else {}

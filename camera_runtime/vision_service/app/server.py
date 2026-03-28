@@ -10,14 +10,28 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from .config import AppConfig, load_config
 from .processor import VisionProcessor
+from .robot_api import build_robot_router
+from .robot_control import RobotControlManager
 from .state import SharedState
 
 config: AppConfig = load_config()
 state = SharedState()
 processor = VisionProcessor(config=config, state=state)
+robot_manager = RobotControlManager(
+    arm_config_path=config.robot_arm_config_path,
+    backend_override=config.robot_backend_override,
+    enabled=config.robot_control_enabled,
+)
 
 app = FastAPI(title="DaBai Vision Service", version="1.0.0")
 static_dir = Path(__file__).resolve().parents[1] / "static"
+app.include_router(
+    build_robot_router(
+        manager=robot_manager,
+        enabled=config.robot_control_enabled,
+        loopback_only=config.robot_loopback_only,
+    )
+)
 
 
 @app.on_event("startup")
@@ -28,6 +42,7 @@ def on_startup() -> None:
 @app.on_event("shutdown")
 def on_shutdown() -> None:
     processor.stop()
+    robot_manager.shutdown()
 
 
 @app.get("/")

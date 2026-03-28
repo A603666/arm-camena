@@ -8,10 +8,14 @@ PUBLISHER_DIR="${ROOT_DIR}/camera_runtime/publisher"
 BUILD_DIR="${PUBLISHER_DIR}/build"
 VISION_DIR="${ROOT_DIR}/camera_runtime/vision_service"
 SDK_LIB_DIR="${ROOT_DIR}/vendor/OrbbecSDK/lib/arm64"
-MODEL_PATH="${ROOT_DIR}/camera_runtime/yolo26n.pt"
+MODEL_DIR="${ROOT_DIR}/camera_runtime"
+DEFAULT_PT_MODEL="${MODEL_DIR}/yolo26n.pt"
+CUSPARSELT_LIB_DIR=""
+TORCH_LIB_DIR=""
 
 publisher_pid=""
 service_pid=""
+cleanup_done=0
 
 require_command() {
     local cmd="$1"
@@ -21,32 +25,178 @@ require_command() {
     fi
 }
 
-cleanup() {
-    local code="${1:-0}"
-    trap - INT TERM
+resolve_default_model_path() {
+    local model_dir="$1"
+    local default_pt="$2"
+    local engines=()
 
-    for pid in "${service_pid}" "${publisher_pid}"; do
+    shopt -s nullglob
+    engines=("${model_dir}"/*.engine)
+    shopt -u nullglob
+
+    if (( ${#engines[@]} > 0 )); then
+        printf '%s\n' "${engines[0]}"
+        return
+    fi
+    printf '%s\n' "${default_pt}"
+}
+
+wait_for_pid_exit() {
+    local pid="$1"
+    local retries="${2:-30}"
+    local interval_sec="${3:-0.1}"
+    local i
+    for ((i = 0; i < retries; ++i)); do
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            return 0
+        fi
+        sleep "${interval_sec}"
+    done
+    return 1
+}
+
+terminate_pid_gracefully() {
+    local pid="$1"
+    local label="$2"
+    if [[ -z "${pid}" ]]; then
+        return 0
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+        return 0
+    fi
+
+    kill -TERM "${pid}" 2>/dev/null || true
+    if ! wait_for_pid_exit "${pid}" 30 0.1; then
+        echo "[vision] ${label} pid=${pid} did not exit after TERM, forcing KILL..."
+        kill -KILL "${pid}" 2>/dev/null || true
+        wait_for_pid_exit "${pid}" 20 0.1 || true
+    fi
+}
+
+cleanup_children() {
+    if [[ "${cleanup_done}" == "1" ]]; then
+        return 0
+    fi
+    cleanup_done=1
+
+    terminate_pid_gracefully "${service_pid}" "vision service"
+    terminate_pid_gracefully "${publisher_pid}" "publisher"
+
+    if [[ -n "${service_pid}" ]]; then
+        wait "${service_pid}" 2>/dev/null || true
+    fi
+    if [[ -n "${publisher_pid}" ]]; then
+        wait "${publisher_pid}" 2>/dev/null || true
+    fi
+}
+
+on_exit() {
+    local code="$?"
+    trap - EXIT INT TERM HUP QUIT
+    cleanup_children
+    return "${code}"
+}
+
+on_signal() {
+    local signame="$1"
+    echo "[vision] signal ${signame} received, stopping processes..."
+    exit 130
+}
+
+find_project_service_pids() {
+    local proc pid cwd cmdline
+    for proc in /proc/[0-9]*; do
+        pid="${proc##*/}"
+        [[ "${pid}" == "$$" ]] && continue
+
+        cwd="$(readlink -f "${proc}/cwd" 2>/dev/null || true)"
+        if [[ "${cwd}" != "${VISION_DIR}" ]]; then
+            continue
+        fi
+
+        cmdline="$(tr '\0' ' ' < "${proc}/cmdline" 2>/dev/null || true)"
+        if [[ "${cmdline}" == *"run_service.py"* ]]; then
+            printf '%s\n' "${pid}"
+        fi
+    done
+}
+
+find_project_publisher_pids() {
+    local proc pid exe
+    for proc in /proc/[0-9]*; do
+        pid="${proc##*/}"
+        [[ "${pid}" == "$$" ]] && continue
+
+        exe="$(readlink -f "${proc}/exe" 2>/dev/null || true)"
+        if [[ "${exe}" == "${BUILD_DIR}/dabai_frame_publisher" ]]; then
+            printf '%s\n' "${pid}"
+        fi
+    done
+}
+
+terminate_stale_processes() {
+    local stale_service_pids=()
+    local stale_publisher_pids=()
+    local pid
+
+    mapfile -t stale_service_pids < <(find_project_service_pids)
+    mapfile -t stale_publisher_pids < <(find_project_publisher_pids)
+
+    if (( ${#stale_service_pids[@]} == 0 && ${#stale_publisher_pids[@]} == 0 )); then
+        return 0
+    fi
+
+    echo "[vision] found stale project processes, cleaning up..."
+    for pid in "${stale_service_pids[@]}"; do
+        echo "[vision] stopping stale vision service pid=${pid}"
+        terminate_pid_gracefully "${pid}" "stale vision service"
+    done
+    for pid in "${stale_publisher_pids[@]}"; do
+        echo "[vision] stopping stale publisher pid=${pid}"
+        terminate_pid_gracefully "${pid}" "stale publisher"
+    done
+
+    for pid in "${stale_service_pids[@]}" "${stale_publisher_pids[@]}"; do
         if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-            kill "${pid}" 2>/dev/null || true
+            echo "[vision] failed to stop stale pid=${pid}" >&2
+            exit 1
         fi
     done
-
-    for pid in "${service_pid}" "${publisher_pid}"; do
-        if [[ -n "${pid}" ]]; then
-            wait "${pid}" 2>/dev/null || true
-        fi
-    done
-
-    exit "${code}"
 }
 
 check_only=false
-if [[ "${1:-}" == "--check" ]]; then
-    check_only=true
-    shift
-fi
+allow_lan_robot_control=false
+while (( "$#" > 0 )); do
+    case "$1" in
+        --check)
+            check_only=true
+            ;;
+        --allow-lan-robot-control)
+            allow_lan_robot_control=true
+            ;;
+        -h|--help)
+            cat <<'EOF'
+Usage: ./scripts/start_vision_arm64.sh [--check] [--allow-lan-robot-control]
 
-trap 'echo "[vision] signal received, stopping processes..."; cleanup 130' INT TERM
+  --check                      Check dependencies and resolved runtime config only.
+  --allow-lan-robot-control    Allow robot control API access from LAN clients.
+EOF
+            exit 0
+            ;;
+        *)
+            echo "[vision] unknown argument: $1" >&2
+            echo "[vision] supported arguments: --check, --allow-lan-robot-control" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+trap on_exit EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP' HUP
+trap 'on_signal QUIT' QUIT
 
 require_command cmake
 require_command pkg-config
@@ -63,10 +213,30 @@ if [[ ! -d "${SDK_LIB_DIR}" ]]; then
     exit 1
 fi
 
-if [[ ! -f "${MODEL_PATH}" ]]; then
-    echo "[vision] YOLO model not found: ${MODEL_PATH}" >&2
-    exit 1
-fi
+while IFS= read -r py_site_path; do
+    [[ -z "${py_site_path}" ]] && continue
+    candidate_cusparselt="${py_site_path}/nvidia/cusparselt/lib"
+    if [[ -d "${candidate_cusparselt}" ]]; then
+        CUSPARSELT_LIB_DIR="${candidate_cusparselt}"
+    fi
+
+    if [[ -z "${TORCH_LIB_DIR}" ]]; then
+        candidate_torch_lib="${py_site_path}/torch/lib"
+        if [[ -d "${candidate_torch_lib}" ]]; then
+            TORCH_LIB_DIR="${candidate_torch_lib}"
+        fi
+    fi
+done < <(python3 - <<'PY'
+import site
+import sysconfig
+
+seen = set()
+for p in (site.getusersitepackages(), sysconfig.get_paths().get("purelib", "")):
+    if p and p not in seen:
+        seen.add(p)
+        print(p)
+PY
+)
 
 if ! pkg-config --exists opencv4; then
     echo "[vision] OpenCV development files not found. Install: sudo apt install libopencv-dev" >&2
@@ -87,17 +257,70 @@ missing = [name for name in modules if importlib.util.find_spec(name) is None]
 if missing:
     print("[vision] missing Python modules: " + ", ".join(missing), file=sys.stderr)
     sys.exit(1)
+
+ws_backends = ["websockets", "wsproto"]
+if not any(importlib.util.find_spec(name) is not None for name in ws_backends):
+    print(
+        "[vision] missing WebSocket backend: install one of " + ", ".join(ws_backends),
+        file=sys.stderr,
+    )
+    sys.exit(1)
 PY
 then
     echo "[vision] install camera_runtime/vision_service/requirements.txt and prepare Jetson torch first." >&2
     exit 1
 fi
 
-export DABAI_YOLO_MODEL="${DABAI_YOLO_MODEL:-${MODEL_PATH}}"
+selected_model="${DABAI_YOLO_MODEL:-}"
+if [[ -z "${selected_model}" ]]; then
+    selected_model="$(resolve_default_model_path "${MODEL_DIR}" "${DEFAULT_PT_MODEL}")"
+    if [[ "${selected_model}" == *.engine ]]; then
+        echo "[vision] auto selected TensorRT engine: ${selected_model}"
+    else
+        echo "[vision] no .engine found, fallback to PyTorch model: ${selected_model}"
+    fi
+fi
+
+if [[ ! -f "${selected_model}" ]]; then
+    echo "[vision] YOLO model not found: ${selected_model}" >&2
+    exit 1
+fi
+
+export DABAI_YOLO_MODEL="${selected_model}"
 export DABAI_WEB_PORT="${DABAI_WEB_PORT:-18000}"
 export DABAI_YOLO_DEVICE="${DABAI_YOLO_DEVICE:-cuda:0}"
-export LD_LIBRARY_PATH="${SDK_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+export DABAI_YOLO_PRECISION="${DABAI_YOLO_PRECISION:-fp32}"
+export DABAI_YOLO_WARMUP="${DABAI_YOLO_WARMUP:-1}"
+export DABAI_GEOM_BACKEND="${DABAI_GEOM_BACKEND:-auto}"
+export DABAI_GEOM_PARITY_CHECK="${DABAI_GEOM_PARITY_CHECK:-0}"
+export DABAI_GEOM_PARITY_EVERY_N="${DABAI_GEOM_PARITY_EVERY_N:-30}"
+export DABAI_ROBOT_CONTROL_ENABLED="${DABAI_ROBOT_CONTROL_ENABLED:-1}"
+robot_loopback_only="${DABAI_ROBOT_LOOPBACK_ONLY:-1}"
+if [[ "${allow_lan_robot_control}" == "true" ]]; then
+    robot_loopback_only="0"
+fi
+export DABAI_ROBOT_LOOPBACK_ONLY="${robot_loopback_only}"
+export DABAI_ROBOT_CONFIG="${DABAI_ROBOT_CONFIG:-${ROOT_DIR}/robot_runtime/config/default.yaml}"
+ld_library_parts=()
+if [[ -n "${TORCH_LIB_DIR}" ]]; then
+    ld_library_parts+=("${TORCH_LIB_DIR}")
+fi
+if [[ -n "${CUSPARSELT_LIB_DIR}" ]]; then
+    ld_library_parts+=("${CUSPARSELT_LIB_DIR}")
+fi
+ld_library_parts+=("${SDK_LIB_DIR}")
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    ld_library_parts+=("${LD_LIBRARY_PATH}")
+fi
+export LD_LIBRARY_PATH="$(IFS=:; echo "${ld_library_parts[*]}")"
 export PYTHONPATH="${ROOT_DIR}/camera_runtime:${PYTHONPATH:-}"
+
+if [[ "${allow_lan_robot_control}" == "true" ]]; then
+    echo "[vision] WARNING: LAN robot control enabled by --allow-lan-robot-control."
+fi
+if [[ "${DABAI_ROBOT_LOOPBACK_ONLY}" == "0" ]]; then
+    echo "[vision] WARNING: robot control API is not loopback-only; LAN clients can send robot commands."
+fi
 
 if [[ "${check_only}" == "true" ]]; then
     echo "[vision] check passed"
@@ -105,8 +328,18 @@ if [[ "${check_only}" == "true" ]]; then
     echo "  model=${DABAI_YOLO_MODEL}"
     echo "  sdk_lib=${SDK_LIB_DIR}"
     echo "  web_port=${DABAI_WEB_PORT}"
+    echo "  yolo_device=${DABAI_YOLO_DEVICE}"
+    echo "  yolo_precision=${DABAI_YOLO_PRECISION}"
+    echo "  geom_backend=${DABAI_GEOM_BACKEND}"
+    echo "  geom_parity_check=${DABAI_GEOM_PARITY_CHECK}"
+    echo "  geom_parity_every_n=${DABAI_GEOM_PARITY_EVERY_N}"
+    echo "  robot_control_enabled=${DABAI_ROBOT_CONTROL_ENABLED}"
+    echo "  robot_loopback_only=${DABAI_ROBOT_LOOPBACK_ONLY}"
+    echo "  robot_config=${DABAI_ROBOT_CONFIG}"
     exit 0
 fi
+
+terminate_stale_processes
 
 build_jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 
@@ -142,4 +375,4 @@ status=$?
 set -e
 
 echo "[vision] one process exited, stopping the other..."
-cleanup "${status}"
+exit "${status}"

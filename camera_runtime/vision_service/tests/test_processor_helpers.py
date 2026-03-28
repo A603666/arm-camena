@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
+
+import numpy as np
 
 from vision_service.app.processor import VisionProcessor
 
@@ -112,3 +115,130 @@ def test_stabilize_axis_holds_then_marks_unreliable() -> None:
     assert state_unreliable == "unreliable"
     assert axis_unreliable is not None
     assert unreliable_quality == 0.1
+
+
+def test_geometry_payload_within_threshold_accepts_small_delta() -> None:
+    lhs = {
+        "status": "ok",
+        "size": {"length_mm": 100.0, "width_mm": 30.0, "height_mm": 12.0},
+        "grasp": {"x_mm": 10.0, "y_mm": 20.0, "z_mm": 30.0, "yaw_deg": 15.0},
+    }
+    rhs = {
+        "status": "ok",
+        "size": {"length_mm": 102.8, "width_mm": 27.5, "height_mm": 14.5},
+        "grasp": {"x_mm": 11.6, "y_mm": 19.3, "z_mm": 31.5, "yaw_deg": 16.4},
+    }
+    ok, _ = VisionProcessor._geometry_payload_within_threshold(lhs, rhs)
+    assert ok is True
+
+
+def test_geometry_payload_within_threshold_rejects_large_delta() -> None:
+    lhs = {
+        "status": "ok",
+        "size": {"length_mm": 100.0, "width_mm": 30.0, "height_mm": 12.0},
+        "grasp": {"x_mm": 10.0, "y_mm": 20.0, "z_mm": 30.0, "yaw_deg": 15.0},
+    }
+    rhs = {
+        "status": "ok",
+        "size": {"length_mm": 104.0, "width_mm": 30.0, "height_mm": 12.0},
+        "grasp": {"x_mm": 10.0, "y_mm": 20.0, "z_mm": 30.0, "yaw_deg": 15.0},
+    }
+    ok, reason = VisionProcessor._geometry_payload_within_threshold(lhs, rhs)
+    assert ok is False
+    assert "size mismatch" in reason
+
+
+def test_run_geometry_with_fallback_uses_cpu_on_backend_error() -> None:
+    class DummyBackend:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    processor = object.__new__(VisionProcessor)
+    processor._cfg = SimpleNamespace(geom_parity_check=False, geom_parity_every_n=30)
+    processor._geometry_backend = DummyBackend("torch")
+    processor._cpu_geometry_backend = DummyBackend("cpu")
+    processor._geometry_force_cpu = False
+    processor._geometry_fallback_count = 0
+    processor._geometry_parity_mismatch_count = 0
+    processor._frame_index = 1
+    processor._axis_tracker = None
+    processor._logger = logging.getLogger("test")
+
+    def fake_compute(*, backend, **kwargs):
+        if backend.name == "torch":
+            raise RuntimeError("gpu failed")
+        return {"status": "ok", "size": None, "grasp": None}, {"total_ms": 1.0}
+
+    processor._compute_geometry_payload = fake_compute  # type: ignore[method-assign]
+
+    payload, timing, backend = processor._run_geometry_with_fallback(
+        depth=np.zeros((4, 4), dtype=np.uint16),
+        bbox=[0, 0, 4, 4],
+        class_id=0,
+        depth_scale=1.0,
+        fx=1.0,
+        fy=1.0,
+        cx=0.0,
+        cy=0.0,
+        ref_uv=(0, 0),
+    )
+    assert payload["status"] == "ok"
+    assert timing["total_ms"] == 1.0
+    assert backend == "cpu_fallback"
+    assert processor._geometry_fallback_count == 1
+
+
+def test_run_geometry_with_fallback_forces_cpu_after_parity_mismatch() -> None:
+    class DummyBackend:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    processor = object.__new__(VisionProcessor)
+    processor._cfg = SimpleNamespace(geom_parity_check=True, geom_parity_every_n=5)
+    processor._geometry_backend = DummyBackend("torch")
+    processor._cpu_geometry_backend = DummyBackend("cpu")
+    processor._geometry_force_cpu = False
+    processor._geometry_fallback_count = 0
+    processor._geometry_parity_mismatch_count = 0
+    processor._frame_index = 10
+    processor._axis_tracker = None
+    processor._logger = logging.getLogger("test")
+
+    def fake_compute(*, backend, **kwargs):
+        if backend.name == "torch":
+            return (
+                {
+                    "status": "ok",
+                    "size": {"length_mm": 120.0, "width_mm": 20.0, "height_mm": 10.0},
+                    "grasp": {"x_mm": 0.0, "y_mm": 0.0, "z_mm": 0.0, "yaw_deg": 0.0},
+                },
+                {"total_ms": 2.0},
+            )
+        return (
+            {
+                "status": "ok",
+                "size": {"length_mm": 130.5, "width_mm": 20.0, "height_mm": 10.0},
+                "grasp": {"x_mm": 0.0, "y_mm": 0.0, "z_mm": 0.0, "yaw_deg": 0.0},
+            },
+            {"total_ms": 3.0},
+        )
+
+    processor._compute_geometry_payload = fake_compute  # type: ignore[method-assign]
+
+    payload, timing, backend = processor._run_geometry_with_fallback(
+        depth=np.zeros((4, 4), dtype=np.uint16),
+        bbox=[0, 0, 4, 4],
+        class_id=0,
+        depth_scale=1.0,
+        fx=1.0,
+        fy=1.0,
+        cx=0.0,
+        cy=0.0,
+        ref_uv=(0, 0),
+    )
+    assert backend == "cpu_forced_parity"
+    assert timing["total_ms"] == 3.0
+    assert abs(payload["size"]["length_mm"] - 130.5) < 1e-6
+    assert processor._geometry_force_cpu is True
+    assert processor._geometry_parity_mismatch_count == 1
+    assert processor._geometry_fallback_count == 1

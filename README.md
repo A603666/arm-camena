@@ -158,6 +158,78 @@ cd 集成测试
 http://127.0.0.1:18000/
 ```
 
+说明：
+
+- 面板同时提供视觉展示与 NERO 核心控制按钮（`status/precheck/enable/home/open/close/show points/run threepoint auto/step/estop`）。
+- 实时结果面板使用 WebSocket（`/ws/vision`），依赖 `websockets` 或 `wsproto`。
+- 默认仅允许本机访问控制接口（loopback-only，无 token）。
+- 启动参数 `--allow-lan-robot-control` 可放开局域网访问控制接口。
+- 可选环境变量：
+  - `DABAI_YOLO_MODEL=/abs/path/to/model.engine|/abs/path/to/model.pt`：显式指定模型路径（未设置时，启动脚本会自动优先 `camera_runtime/*.engine`，否则回退到 `camera_runtime/yolo26n.pt`）
+  - `DABAI_ROBOT_CONTROL_ENABLED=1|0`：启用/禁用网页控制
+  - `DABAI_ROBOT_LOOPBACK_ONLY=1|0`：限制/放开仅本机访问
+  - `DABAI_ROBOT_CONFIG=/abs/path/to/default.yaml`：指定机械臂配置文件
+  - `DABAI_YOLO_DEVICE=cuda:0|cpu`：YOLO 推理设备
+  - `DABAI_YOLO_IMGSZ=512`：YOLO 输入尺寸（默认 `512`，范围 `320~1280`）
+  - `DABAI_YOLO_PRECISION=fp32|fp16`：YOLO 推理精度（默认 `fp32`，推荐先保持）
+  - `DABAI_YOLO_WARMUP=1|0`：启动时是否执行一次 YOLO 预热
+  - `DABAI_GEOM_BACKEND=auto|cpu|torch|cuml`：几何后处理后端（默认 `auto`）
+  - `DABAI_GEOM_PARITY_CHECK=1|0`：是否启用 GPU/CPU 抽样一致性校验
+  - `DABAI_GEOM_PARITY_EVERY_N=30`：一致性校验采样间隔（帧）
+
+### 6.3.1 远程网页控制（局域网）
+
+默认本机安全模式（仅 `127.0.0.1` 可调用机械臂控制 API）：
+
+```bash
+cd 集成测试
+./scripts/start_vision_arm64.sh
+```
+
+放开局域网控制（允许局域网设备通过 `http://<jetson-ip>:18000/` 调用控制 API）：
+
+```bash
+cd 集成测试
+./scripts/start_vision_arm64.sh --allow-lan-robot-control
+```
+
+安全警告：
+
+- 放开后，同网段设备可直接下发机械臂控制命令，请仅在受控联调网络中使用。
+- 现场联调建议保留物理急停与旁站，不要在生产网络长期开启。
+
+### 6.3.2 TensorRT (`.engine`) 导出与切换
+
+在目标 Jetson 本机导出（`.engine` 与 TensorRT/CUDA/GPU 环境强绑定）：
+
+```bash
+cd 集成测试
+yolo export model=/home/jetson/Desktop/集成测试/camera_runtime/yolo26n.pt format=engine half=True dynamic=False batch=1 imgsz=512 device=0
+```
+
+推荐使用脚本自动探测数据流参数并导出：
+
+```bash
+cd 集成测试
+./scripts/export_yolo_engine.sh --probe-only
+./scripts/export_yolo_engine.sh
+```
+
+说明：
+- 脚本默认订阅 `tcp://127.0.0.1:5557` / `frames.rgbd.v1`，从实时 `meta` 中读取 `rgb_w/rgb_h/depth_w/depth_h/fx/fy/cx/cy/depth_scale`
+- `--imgsz auto`（默认）时会按流分辨率自动推导导出尺寸（对齐到 32，范围 `320~1280`）
+- 无实时流时自动回退 `imgsz=512`，也可手工指定：`./scripts/export_yolo_engine.sh --imgsz 512`
+
+导出完成后，将生成的 `.engine` 放到 `camera_runtime/` 目录。  
+`./scripts/start_vision_arm64.sh` 在未设置 `DABAI_YOLO_MODEL` 时会自动优先加载 `.engine`。
+
+强制回退 `.pt`：
+
+```bash
+export DABAI_YOLO_MODEL=/home/jetson/Desktop/集成测试/camera_runtime/yolo26n.pt
+./scripts/start_vision_arm64.sh
+```
+
 ### 6.4 启动动态抓取主程序
 
 ```bash
@@ -246,8 +318,9 @@ python3 validate_nero_handeye_setup.py
 
 模型找不到：
 
-- 确认 `camera_runtime/yolo26n.pt` 存在
-- 或设置 `export DABAI_YOLO_MODEL=/your/model.pt`
+- 若未设置 `DABAI_YOLO_MODEL`，脚本会自动按 `camera_runtime/*.engine -> camera_runtime/yolo26n.pt` 顺序选择
+- 确认自动选择到的模型文件确实存在
+- 或显式设置 `export DABAI_YOLO_MODEL=/your/model.engine`（也可指向 `/your/model.pt`）
 
 相机动态库找不到：
 

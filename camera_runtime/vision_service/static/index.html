@@ -12,6 +12,7 @@
       --soft: #607080;
       --ok: #1f9d55;
       --warn: #d97706;
+      --danger: #b91c1c;
       --line: #d7e0e8;
       --brand: #0f766e;
     }
@@ -26,7 +27,7 @@
         var(--bg);
     }
     .page {
-      max-width: 1200px;
+      max-width: 1280px;
       margin: 0 auto;
       padding: 18px;
       display: grid;
@@ -40,6 +41,7 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 12px;
     }
     .title {
       margin: 0;
@@ -51,23 +53,31 @@
       color: var(--soft);
       font-size: 14px;
     }
+    .badges {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
     .status {
       font-size: 13px;
       padding: 6px 12px;
       border-radius: 999px;
       border: 1px solid var(--line);
       background: #f7fbff;
+      color: #334155;
     }
     .grid {
       display: grid;
-      grid-template-columns: 1.5fr 1fr;
+      grid-template-columns: 1.25fr 1fr 1fr;
       gap: 14px;
+      align-items: start;
     }
     .card {
       background: var(--card);
       border: 1px solid var(--line);
       border-radius: 12px;
       padding: 12px;
+      min-width: 0;
     }
     .card h2 {
       margin: 0 0 10px;
@@ -89,9 +99,15 @@
       margin-top: 8px;
     }
     .kv .k { color: var(--soft); }
-    .kv .v { font-weight: 600; }
+    .kv .v {
+      font-weight: 600;
+      text-align: right;
+      max-width: 290px;
+      overflow-wrap: anywhere;
+    }
     .ok { color: var(--ok); }
     .warn { color: var(--warn); }
+    .danger { color: var(--danger); }
     pre {
       margin: 0;
       max-height: 300px;
@@ -101,9 +117,46 @@
       padding: 10px;
       border-radius: 8px;
       font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .btn-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    button {
+      border: 1px solid #c8d6e2;
+      background: #f8fbfd;
+      color: #183043;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover { border-color: #9eb3c7; }
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    button.danger-btn {
+      border-color: #f1b8b8;
+      background: #fff0f0;
+      color: #9f1d1d;
+      font-weight: 700;
+    }
+    .robot-meta {
+      margin-top: 8px;
+      color: var(--soft);
+      font-size: 12px;
+    }
+    @media (max-width: 1120px) {
+      .grid { grid-template-columns: 1fr 1fr; }
     }
     @media (max-width: 920px) {
       .grid { grid-template-columns: 1fr; }
+      .btn-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
   </style>
 </head>
@@ -111,10 +164,13 @@
   <div class="page">
     <div class="header">
       <div>
-        <h1 class="title">DaBai 相机视觉面板</h1>
-        <p class="sub">YOLO 推理 + 深度几何 + 抓取点输出（相机坐标系）</p>
+        <h1 class="title">DaBai 视觉与机械臂联调面板</h1>
+        <p class="sub">YOLO 推理 + 深度几何 + NERO 核心控制命令</p>
       </div>
-      <div id="healthBadge" class="status">连接中...</div>
+      <div class="badges">
+        <div id="healthBadge" class="status">视觉连接中...</div>
+        <div id="robotBadge" class="status">机械臂状态未知</div>
+      </div>
     </div>
 
     <div class="grid">
@@ -122,6 +178,7 @@
         <h2>标注视频流</h2>
         <img id="stream" class="video" src="/stream/annotated" alt="annotated stream" />
       </div>
+
       <div class="card">
         <h2>实时结果</h2>
         <div class="kv">
@@ -138,20 +195,82 @@
           <div class="k">FPS</div><div id="fps" class="v">-</div>
         </div>
       </div>
+
+      <div class="card">
+        <h2>机械臂控制</h2>
+        <div class="kv">
+          <div class="k">控制功能</div><div id="robotEnabled" class="v">-</div>
+          <div class="k">连接状态</div><div id="robotConnected" class="v">-</div>
+          <div class="k">执行状态</div><div id="robotBusy" class="v">-</div>
+          <div class="k">J7 实时角度</div><div id="robotJ7" class="v">-</div>
+          <div class="k">逐步进度</div><div id="robotStep" class="v">-</div>
+          <div class="k">最后命令</div><div id="robotLast" class="v">-</div>
+        </div>
+
+        <div class="btn-grid" id="robotButtons">
+          <button data-command="status">状态</button>
+          <button data-command="precheck">预检</button>
+          <button data-command="enable">使能</button>
+          <button data-command="home">回零</button>
+          <button data-command="open">开夹爪</button>
+          <button data-command="close">关夹爪</button>
+          <button data-command="show_points">显示四点</button>
+          <button data-command="run_threepoint_auto">自动流程</button>
+          <button data-command="run_threepoint_step_start">逐步开始</button>
+          <button data-command="run_threepoint_step_next">逐步下一步</button>
+          <button data-command="run_threepoint_step_cancel">逐步取消</button>
+          <button class="danger-btn" data-command="estop">急停</button>
+        </div>
+        <div class="robot-meta">命令执行时会自动锁定非急停按钮，避免并发下发运动指令。</div>
+      </div>
     </div>
 
-    <div class="card">
-      <h2>原始 JSON</h2>
-      <pre id="raw">{}</pre>
+    <div class="grid">
+      <div class="card">
+        <h2>机械臂命令输出</h2>
+        <pre id="robotOutput">{}</pre>
+      </div>
+      <div class="card">
+        <h2>视觉原始 JSON</h2>
+        <pre id="raw">{}</pre>
+      </div>
     </div>
   </div>
 
   <script>
     const el = (id) => document.getElementById(id);
 
+    const robotCommandButtons = Array.from(document.querySelectorAll("#robotButtons button[data-command]"));
+    let robotStateCache = null;
+
     function fmt(n, digits = 2) {
       if (n === null || n === undefined || Number.isNaN(n)) return "-";
       return Number(n).toFixed(digits);
+    }
+
+    function toDeg(rad) {
+      if (rad === null || rad === undefined || Number.isNaN(rad)) return null;
+      return Number(rad) * 180 / Math.PI;
+    }
+
+    function setRobotButtonsDisabled() {
+      const enabled = !!robotStateCache?.enabled;
+      const busy = !!robotStateCache?.busy;
+      robotCommandButtons.forEach((btn) => {
+        const cmd = btn.dataset.command;
+        const isEstop = cmd === "estop";
+        if (!enabled) {
+          btn.disabled = !isEstop;
+          return;
+        }
+        btn.disabled = busy && !isEstop;
+      });
+    }
+
+    function setRobotBadge(text, cls) {
+      const badge = el("robotBadge");
+      badge.textContent = text;
+      badge.className = "status " + (cls || "");
     }
 
     function updateView(data) {
@@ -194,11 +313,142 @@
         const resp = await fetch("/api/health", { cache: "no-store" });
         const h = await resp.json();
         const ok = !!h.stream_connected;
-        el("healthBadge").textContent = ok ? "流已连接" : "等待相机流";
-        el("healthBadge").style.color = ok ? "#166534" : "#92400e";
+        const badge = el("healthBadge");
+        badge.textContent = ok ? "视觉流已连接" : "等待相机流";
+        badge.className = "status " + (ok ? "ok" : "warn");
       } catch (_) {
-        el("healthBadge").textContent = "连接异常";
+        const badge = el("healthBadge");
+        badge.textContent = "视觉连接异常";
+        badge.className = "status warn";
       }
+    }
+
+    function renderRobotState(data) {
+      robotStateCache = data ?? null;
+
+      const enabled = !!data?.enabled;
+      const connected = !!data?.connected;
+      const busy = !!data?.busy;
+      const j7Rad = data?.joint_positions_rad?.[6];
+      const j7Deg = toDeg(j7Rad);
+      const step = data?.step_progress ?? {};
+      const last = data?.last_result ?? {};
+
+      el("robotEnabled").textContent = enabled ? "启用" : "禁用";
+      el("robotEnabled").className = "v " + (enabled ? "ok" : "warn");
+
+      el("robotConnected").textContent = connected ? "已连接" : "未连接";
+      el("robotConnected").className = "v " + (connected ? "ok" : "warn");
+
+      el("robotBusy").textContent = busy ? "执行中" : "空闲";
+      el("robotBusy").className = "v " + (busy ? "warn" : "ok");
+
+      if (j7Deg == null) {
+        el("robotJ7").textContent = "-";
+        el("robotJ7").className = "v";
+      } else {
+        const safe = j7Deg > 10.0;
+        el("robotJ7").textContent = `${fmt(j7Deg, 2)} deg`;
+        el("robotJ7").className = "v " + (safe ? "ok" : "danger");
+      }
+
+      const stepText = step?.active
+        ? `${step.index}/${step.total} -> ${step.next_label ?? "-"}`
+        : (step?.total > 0 ? `${step.index}/${step.total} (已结束)` : "未开始");
+      el("robotStep").textContent = stepText;
+
+      const lastText = `${last.command || "-"}: ${last.message || "-"}`;
+      el("robotLast").textContent = lastText;
+
+      if (!enabled) {
+        setRobotBadge("机械臂控制禁用", "warn");
+      } else if (busy) {
+        setRobotBadge("机械臂执行中", "warn");
+      } else if (connected) {
+        setRobotBadge("机械臂已连接", "ok");
+      } else {
+        setRobotBadge("机械臂未连接", "warn");
+      }
+
+      setRobotButtonsDisabled();
+    }
+
+    async function parseErrorResponse(resp) {
+      let payload = null;
+      try {
+        payload = await resp.json();
+      } catch (_) {
+        try {
+          payload = { detail: await resp.text() };
+        } catch (_) {
+          payload = null;
+        }
+      }
+      const detail = payload?.detail || payload?.message || `HTTP ${resp.status}`;
+      return { status: resp.status, detail: String(detail) };
+    }
+
+    async function refreshRobotState() {
+      try {
+        const resp = await fetch("/api/robot/state", { cache: "no-store" });
+        if (!resp.ok) {
+          const errInfo = await parseErrorResponse(resp);
+          const detailLower = errInfo.detail.toLowerCase();
+          if (errInfo.status === 403 && detailLower.includes("loopback")) {
+            robotStateCache = null;
+            setRobotButtonsDisabled();
+            setRobotBadge("机械臂控制仅本机可用", "warn");
+            el("robotOutput").textContent = "当前仅允许本机控制，请用 --allow-lan-robot-control 重启服务";
+            return;
+          }
+          throw new Error(errInfo.detail);
+        }
+        const data = await resp.json();
+        renderRobotState(data);
+      } catch (err) {
+        setRobotBadge("机械臂状态读取失败", "warn");
+        el("robotOutput").textContent = String(err);
+      }
+    }
+
+    async function sendRobotCommand(command) {
+      if (!command) return;
+      try {
+        const resp = await fetch("/api/robot/command", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ command }),
+        });
+
+        let payload = null;
+        try {
+          payload = await resp.json();
+        } catch (_) {
+          payload = { message: await resp.text() };
+        }
+
+        if (!resp.ok) {
+          throw new Error(payload?.detail || payload?.message || `HTTP ${resp.status}`);
+        }
+
+        const lines = payload?.stdout_lines ?? [];
+        const header = `${payload?.command || command}: ${payload?.message || "done"}`;
+        const body = lines.length > 0 ? lines.join("\n") : "(no stdout)";
+        el("robotOutput").textContent = `${header}\n\n${body}`;
+      } catch (err) {
+        el("robotOutput").textContent = `${command}: ${String(err)}`;
+      } finally {
+        refreshRobotState();
+      }
+    }
+
+    function bindRobotButtons() {
+      robotCommandButtons.forEach((btn) => {
+        btn.addEventListener("click", () => {
+          sendRobotCommand(btn.dataset.command || "");
+        });
+      });
+      setRobotButtonsDisabled();
     }
 
     function connectWs() {
@@ -212,9 +462,13 @@
       ws.onclose = () => setTimeout(connectWs, 1500);
     }
 
+    bindRobotButtons();
     connectWs();
     refreshHealth();
+    refreshRobotState();
+
     setInterval(refreshHealth, 2000);
+    setInterval(refreshRobotState, 1000);
   </script>
 </body>
 </html>
