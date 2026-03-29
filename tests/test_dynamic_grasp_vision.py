@@ -54,6 +54,24 @@ class DynamicGraspVisionTests(unittest.TestCase):
         snapshot = VisionSnapshot.from_payload({"status": "ok", "target": {"bbox_xyxy": [1, 2, 3, 4]}})
         self.assertFalse(snapshot.is_trackable)
 
+    def test_snapshot_parser_extracts_quality_fields(self) -> None:
+        snapshot = VisionSnapshot.from_payload(
+            {
+                "status": "ok",
+                "target": {"bbox_xyxy": [10, 20, 30, 40]},
+                "grasp": {
+                    "x_mm": 10.0,
+                    "y_mm": -20.0,
+                    "z_mm": 800.0,
+                    "axis_dir_cam": [1.0, 0.0, 0.0],
+                },
+                "segmentation": {"quality_score": 0.72, "quality_flags": []},
+            }
+        )
+        self.assertAlmostEqual(snapshot.source_quality_score or 0.0, 0.72, places=6)
+        self.assertEqual(snapshot.quality_flags, ())
+        self.assertTrue(snapshot.quality_ok)
+
     @patch("dynamic_grasp.vision_client.urllib.request.urlopen")
     def test_health_request_parses_json(self, mock_urlopen) -> None:
         mock_urlopen.return_value = _FakeResponse(

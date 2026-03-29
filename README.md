@@ -1,4 +1,4 @@
-# 集成测试 Jetson ARM64 一体化运行包（四点位流程版）
+# 集成测试 Jetson ARM64 一体化运行包（五点位流程版，含 prepick）
 
 本目录是可直接拷贝部署的单文件夹运行包。将整个 `集成测试` 复制到目标 Jetson 后，即可运行：
 
@@ -11,15 +11,16 @@
 
 ---
 
-## 1. 当前业务流程（四点位）
+## 1. 当前业务流程（五点位）
 
 系统当前业务流程固定为：
 
-`到预备 -> 预备开夹爪 -> 到夹取 -> 关闭夹爪 -> 回预备 -> 到搬运 -> 到倾倒 -> 开夹爪 -> 回搬运 -> 回预备`
+`到预备 -> 预备开夹爪 -> 到预备夹取 -> 到夹取 -> 关闭夹爪 -> 回预备 -> 到搬运 -> 到倾倒 -> 开夹爪 -> 回搬运 -> 回预备`
 
 对应点位命名：
 
 - `ready`：预备
+- `prepick`：预备夹取（由 `pick` 点位在竖直方向上抬 5cm 派生）
 - `pick`：夹取
 - `transport`：搬运
 - `dump`：倾倒
@@ -81,7 +82,7 @@ sudo udevadm trigger
 
 ### 4.2 USB-CAN 端口绑定
 
-默认 USB-CAN 端口在 `robot_runtime/config/auto_enable.yaml` 中配置为固定 `usb_bus_info`。
+默认 USB-CAN 端口在 `pipeline_config.yaml` 的 `auto_enable.usb_bus_info` 中配置为固定值。
 
 如果现场接口变化，请先改该配置再启动自动使能。
 
@@ -89,34 +90,31 @@ sudo udevadm trigger
 
 ## 5. 配置说明
 
-### 5.1 动态抓取配置 `dynamic_grasp_config.yaml`
+### 5.1 统一主配置（首选）`pipeline_config.yaml`
 
-重点字段：
+统一配置包含 4 组主参数：
 
-- `vision`：视觉服务地址、轮询频率、健康检查参数
-- `handeye`：手眼参数路径
-- `scan/grasp`：扫描收敛、下探安全高度、抓取验证区间
-- `route`：流程点位来源
-  - `ready_from: threepoint.ready`
-  - `transport_from: threepoint.transport`
-  - `dump_from: threepoint.dump`
+- `dynamic_grasp`：动态抓取主流程（视觉轮询、扫描、抓取、安全阈值、路线引用）
+- `vision_runtime`：视觉服务与相机发布器参数（`DABAI_*` 映射来源）
+- `robot_runtime`：机械臂运行参数（CAN、夹爪、安全、`threepoint` 点位流程）
+- `auto_enable`：自动使能 daemon 参数（USB-CAN 绑定、重试/超时）
 
-兼容性：
+默认启动脚本会优先读取 `pipeline_config.yaml`。
+`scripts/unified_config_loader.py` 用于把统一配置分发为运行时参数（动态抓取配置段、视觉 `DABAI_*` 环境变量、机械臂配置段、auto-enable 配置段）。
 
-- `transport_from` 是新字段
-- 若旧配置仍使用 `dump_pre_from`，程序会自动作为 `transport_from` 读取
+### 5.2 旧配置兼容（仍可用）
 
-### 5.2 机械臂默认配置 `robot_runtime/config/default.yaml`
+以下文件仍可单独使用：
 
-`threepoint` 节点已升级为四点位（字段名保持兼容）：
+- `dynamic_grasp_config.yaml`
+- `robot_runtime/config/default.yaml`
+- `robot_runtime/config/auto_enable.yaml`
 
-- `strict_down_enabled: false`
-  - 默认不锁死 `pick` 姿态，降低奇异解/无解风险
-- `min_joint7_deg: 10.0`
-  - 严格执行 `J7 > 10°`
-- 四个示教点：`ready/pick/transport/dump`
-  - 均包含 `joints_deg` 与 `pose_mm_deg`
-  - 已写入你最新示教数据
+字段兼容关系：
+
+- `route.dump_pre_from` 仍兼容读取为 `route.transport_from`
+- `nero_auto_enable_daemon.py --config` 同时支持统一配置和旧 `auto_enable.yaml`
+- `nero_test_cli.py --config` 同时支持统一配置和旧机械臂配置
 
 ---
 
@@ -126,7 +124,7 @@ sudo udevadm trigger
 
 ```bash
 cd 集成测试
-./scripts/start_vision_arm64.sh --check
+./scripts/start_vision_arm64.sh --check --config ./pipeline_config.yaml
 ```
 
 ### 6.2 启动自动使能 daemon
@@ -135,7 +133,7 @@ cd 集成测试
 
 ```bash
 cd 集成测试
-python3 robot_runtime/nero_auto_enable_daemon.py --config robot_runtime/config/auto_enable.yaml
+python3 robot_runtime/nero_auto_enable_daemon.py --config ./pipeline_config.yaml
 ```
 
 或安装 systemd 服务：
@@ -143,13 +141,15 @@ python3 robot_runtime/nero_auto_enable_daemon.py --config robot_runtime/config/a
 ```bash
 cd 集成测试
 ./scripts/install_auto_enable_service.sh
+# or:
+# ./scripts/install_auto_enable_service.sh --config /abs/path/to/pipeline_config.yaml
 ```
 
 ### 6.3 启动视觉服务
 
 ```bash
 cd 集成测试
-./scripts/start_vision_arm64.sh
+./scripts/start_vision_arm64.sh --config ./pipeline_config.yaml
 ```
 
 默认面板地址：
@@ -160,15 +160,16 @@ http://127.0.0.1:18000/
 
 说明：
 
-- 面板同时提供视觉展示与 NERO 核心控制按钮（`status/precheck/enable/home/open/close/show points/run threepoint auto/step/estop`）。
+- 面板同时提供视觉展示与 NERO 核心控制按钮（`status/precheck/enable/home/open/close/show points/run threepoint auto/step/reset_clear_errors/disable/estop`）。
 - 实时结果面板使用 WebSocket（`/ws/vision`），依赖 `websockets` 或 `wsproto`。
 - 默认仅允许本机访问控制接口（loopback-only，无 token）。
 - 启动参数 `--allow-lan-robot-control` 可放开局域网访问控制接口。
+- 启动参数 `--config` 可显式指定统一配置路径（默认优先 `./pipeline_config.yaml`）。
 - 可选环境变量：
   - `DABAI_YOLO_MODEL=/abs/path/to/model.engine|/abs/path/to/model.pt`：显式指定模型路径（未设置时，启动脚本会自动优先 `camera_runtime/*.engine`，否则回退到 `camera_runtime/yolo26n.pt`）
   - `DABAI_ROBOT_CONTROL_ENABLED=1|0`：启用/禁用网页控制
   - `DABAI_ROBOT_LOOPBACK_ONLY=1|0`：限制/放开仅本机访问
-  - `DABAI_ROBOT_CONFIG=/abs/path/to/default.yaml`：指定机械臂配置文件
+  - `DABAI_ROBOT_CONFIG=/abs/path/to/pipeline_config.yaml|/abs/path/to/default.yaml`：指定机械臂配置文件
   - `DABAI_YOLO_DEVICE=cuda:0|cpu`：YOLO 推理设备
   - `DABAI_YOLO_IMGSZ=512`：YOLO 输入尺寸（默认 `512`，范围 `320~1280`）
   - `DABAI_YOLO_PRECISION=fp32|fp16`：YOLO 推理精度（默认 `fp32`，推荐先保持）
@@ -176,6 +177,23 @@ http://127.0.0.1:18000/
   - `DABAI_GEOM_BACKEND=auto|cpu|torch|cuml`：几何后处理后端（默认 `auto`）
   - `DABAI_GEOM_PARITY_CHECK=1|0`：是否启用 GPU/CPU 抽样一致性校验
   - `DABAI_GEOM_PARITY_EVERY_N=30`：一致性校验采样间隔（帧）
+  - `DABAI_TARGET_LOCK_IOU_MIN`：目标锚定 IoU 下限（默认 `0.45`）
+  - `DABAI_TARGET_LOCK_HITS`：目标进入 locked 前连续命中帧数（默认 `2`）
+  - `DABAI_TARGET_LOST_HOLD_FRAMES`：目标短时丢失保持帧数（默认 `6`）
+  - `DABAI_TARGET_MAX_CENTER_JUMP_PX`：目标中心跳变硬阈值（默认 `80` px）
+  - `DABAI_TARGET_MAX_DEPTH_JUMP_MM`：目标中心深度跳变硬阈值（默认 `80` mm）
+  - `DABAI_SUPPORT_SWITCH_HOLD_FRAMES`：`support_region/legacy_cluster` 源切换迟滞帧数（默认 `3`）
+  - `DABAI_DEPTH_VALID_RATIO_MIN`：ROI 最低有效深度比例（默认 `0.03`）
+  - `DABAI_SUPPORT_POINTS_MIN`：最低支撑点数（默认 `180`）
+  - `DABAI_SUPPORT_FILL_RATIO_MIN`：最低支撑填充比（默认 `0.02`）
+  - `DABAI_GROUND_RATIO_MAX`：最高地面占比（默认 `0.96`）
+  - `DABAI_QUALITY_SCORE_MIN`：几何质量分数下限（默认 `0.50`）
+  - `DABAI_GRASP_POINT_SMOOTH_ALPHA=0~1`：抓取点 XYZ EMA 平滑系数（默认 `0.20`）
+  - `DABAI_GRASP_YAW_SMOOTH_ALPHA=0~1`：抓取 yaw EMA 平滑系数（默认 `0.20`）
+  - `DABAI_GRASP_HOLD_FRAMES=0~60`：异常跳变时短时保持帧数（默认 `7`）
+  - `DABAI_GRASP_JUMP_XY_MM`：XY 跳变阈值（默认 `22` mm）
+  - `DABAI_GRASP_JUMP_Z_MM`：Z 跳变阈值（默认 `22` mm）
+  - `DABAI_GRASP_JUMP_YAW_DEG`：yaw 跳变阈值（默认 `20` deg）
 
 ### 6.3.1 远程网页控制（局域网）
 
@@ -227,7 +245,7 @@ cd 集成测试
 
 ```bash
 export DABAI_YOLO_MODEL=/home/jetson/Desktop/集成测试/camera_runtime/yolo26n.pt
-./scripts/start_vision_arm64.sh
+./scripts/start_vision_arm64.sh --config ./pipeline_config.yaml
 ```
 
 ### 6.4 启动动态抓取主程序
@@ -236,6 +254,11 @@ export DABAI_YOLO_MODEL=/home/jetson/Desktop/集成测试/camera_runtime/yolo26n
 cd 集成测试
 ./scripts/start_dynamic_grasp.sh
 ```
+
+说明：
+
+- 若存在 `./pipeline_config.yaml`，脚本会优先读取其中的 `dynamic_grasp` 配置。
+- 若不存在统一配置，则自动回退到 `dynamic_grasp_config.yaml`。
 
 常用参数：
 
@@ -253,22 +276,22 @@ cd 集成测试
 
 ```bash
 cd 集成测试
-python3 robot_runtime/nero_test_cli.py --config robot_runtime/config/default.yaml
+python3 robot_runtime/nero_test_cli.py --config ./pipeline_config.yaml
 ```
 
 常用命令：
 
 - `status`：查看关节与法兰反馈
 - `precheck`：运行前检查（包含点位完整性与 `J7 > 10°` 校验）
-- `show points`：打印四点位参数
-- `run threepoint step`：四点位分步执行
-- `run threepoint auto`：四点位自动执行
+- `show points`：打印五点位参数（含派生 `prepick`）
+- `run threepoint step`：五点位分步执行
+- `run threepoint auto`：五点位自动执行
 - `open` / `close`：测试夹爪
 - `estop`：急停
 
 `run threepoint` 实际顺序：
 
-`ready -> open -> pick -> close -> save_closed_state -> ready -> transport -> dump -> open -> transport -> ready`
+`ready -> open -> prepick -> pick -> close -> save_closed_state -> ready -> transport -> dump -> open -> transport -> ready`
 
 ---
 
@@ -325,17 +348,17 @@ python3 validate_nero_handeye_setup.py
 相机动态库找不到：
 
 - 确认 `vendor/OrbbecSDK/lib/arm64` 存在
-- 通过 `./scripts/start_vision_arm64.sh` 启动，让脚本自动设置 `LD_LIBRARY_PATH`
+- 通过 `./scripts/start_vision_arm64.sh --config ./pipeline_config.yaml` 启动，让脚本自动设置 `LD_LIBRARY_PATH`
 
 USB-CAN 不匹配：
 
-- 检查 `robot_runtime/config/auto_enable.yaml` 的 `usb_bus_info`
+- 检查 `pipeline_config.yaml` 中 `auto_enable.usb_bus_info`
 - 确认实际 USB 端口未变化
 
 自动使能未恢复：
 
 - 先前台执行一次：
-  `python3 robot_runtime/nero_auto_enable_daemon.py --once`
+  `python3 robot_runtime/nero_auto_enable_daemon.py --config ./pipeline_config.yaml --once`
 - 再看服务状态：
   `systemctl status nero-auto-enable.service --no-pager`
 

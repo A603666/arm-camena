@@ -103,14 +103,13 @@ def depth_roi_to_points(
     return points, uv
 
 
-def fit_ground_plane(points: np.ndarray, residual_mm: float, max_trials: int = 120) -> GroundPlaneModel | None:
-    if points.shape[0] < 100:
-        return None
-
-    max_trials = max(8, int(max_trials))
-    xy = points[:, :2]
-    z = points[:, 2]
-    min_samples = max(30, min(80, int(points.shape[0] * 0.02)))
+def _fit_ransac_inlier_mask(
+    xy: np.ndarray,
+    z: np.ndarray,
+    residual_mm: float,
+    max_trials: int,
+    min_samples: int,
+) -> np.ndarray | None:
     try:
         try:
             ransac = RANSACRegressor(
@@ -129,41 +128,135 @@ def fit_ground_plane(points: np.ndarray, residual_mm: float, max_trials: int = 1
                 random_state=42,
             )
         ransac.fit(xy, z)
-        inlier_mask = ransac.inlier_mask_
-        if inlier_mask is None:
-            return None
-        inlier_mask = inlier_mask.astype(bool)
-        if int(np.count_nonzero(inlier_mask)) < 60:
-            return None
-
-        xy_inliers = xy[inlier_mask]
-        z_inliers = z[inlier_mask]
-        design = np.column_stack([xy_inliers, np.ones(xy_inliers.shape[0], dtype=np.float32)])
-        coeffs, _, _, _ = np.linalg.lstsq(design, z_inliers, rcond=None)
-        coeffs = coeffs.astype(np.float32)
-        a, b, c = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
-
-        raw_normal = np.array([a, b, -1.0], dtype=np.float32)
-        normal_cam = _normalize_vector(raw_normal)
-        if normal_cam is None:
-            return None
-        offset_mm = float(c / float(np.linalg.norm(raw_normal)))
-
-        plane_basis = _make_plane_basis(normal_cam)
-        if plane_basis is None:
-            return None
-        basis_u_cam, basis_v_cam = plane_basis
-
-        return GroundPlaneModel(
-            inlier_mask=inlier_mask,
-            normal_cam=normal_cam,
-            offset_mm=offset_mm,
-            basis_u_cam=basis_u_cam,
-            basis_v_cam=basis_v_cam,
-            coefficients=coeffs,
-        )
     except Exception:
         return None
+
+    inlier_mask = ransac.inlier_mask_
+    if inlier_mask is None:
+        return None
+    return np.asarray(inlier_mask, dtype=bool).reshape(-1)
+
+
+def _solve_plane_coefficients(xy: np.ndarray, z: np.ndarray) -> np.ndarray | None:
+    if xy.shape[0] < 3:
+        return None
+    try:
+        design = np.column_stack([xy, np.ones(xy.shape[0], dtype=np.float32)])
+        coeffs, _, _, _ = np.linalg.lstsq(design, z, rcond=None)
+        return np.asarray(coeffs, dtype=np.float32).reshape(3)
+    except Exception:
+        return None
+
+
+def _build_ground_plane_model(points: np.ndarray, inlier_mask: np.ndarray) -> GroundPlaneModel | None:
+    if points.shape[0] < 100:
+        return None
+    if inlier_mask.shape[0] != points.shape[0]:
+        return None
+
+    inlier_mask = inlier_mask.astype(bool, copy=False)
+    if int(np.count_nonzero(inlier_mask)) < 60:
+        return None
+
+    xy_inliers = points[inlier_mask, :2]
+    z_inliers = points[inlier_mask, 2]
+    coeffs = _solve_plane_coefficients(xy_inliers, z_inliers)
+    if coeffs is None:
+        return None
+
+    a, b, c = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
+    raw_normal = np.array([a, b, -1.0], dtype=np.float32)
+    normal_cam = _normalize_vector(raw_normal)
+    if normal_cam is None:
+        return None
+    offset_mm = float(c / float(np.linalg.norm(raw_normal)))
+
+    plane_basis = _make_plane_basis(normal_cam)
+    if plane_basis is None:
+        return None
+    basis_u_cam, basis_v_cam = plane_basis
+
+    return GroundPlaneModel(
+        inlier_mask=inlier_mask,
+        normal_cam=normal_cam,
+        offset_mm=offset_mm,
+        basis_u_cam=basis_u_cam,
+        basis_v_cam=basis_v_cam,
+        coefficients=coeffs,
+    )
+
+
+def fit_ground_plane(points: np.ndarray, residual_mm: float, max_trials: int = 120) -> GroundPlaneModel | None:
+    if points.shape[0] < 100:
+        return None
+
+    max_trials = max(8, int(max_trials))
+    xy = points[:, :2]
+    z = points[:, 2]
+    min_samples = max(30, min(80, int(points.shape[0] * 0.02)))
+    inlier_mask = _fit_ransac_inlier_mask(
+        xy=xy,
+        z=z,
+        residual_mm=float(residual_mm),
+        max_trials=max_trials,
+        min_samples=min_samples,
+    )
+    if inlier_mask is None:
+        return None
+    return _build_ground_plane_model(points, inlier_mask)
+
+
+def fit_ground_plane_conservative_fast(
+    points: np.ndarray,
+    residual_mm: float,
+    max_trials: int = 120,
+    fast_enabled: bool = True,
+    fast_sample_cap: int = 2500,
+    fast_max_trials: int = 40,
+    fast_min_inlier_ratio: float = 0.55,
+    fast_min_inliers: int = 80,
+) -> tuple[GroundPlaneModel | None, str]:
+    if points.shape[0] < 100:
+        return None, "full"
+
+    if (not fast_enabled) or int(fast_sample_cap) <= 0:
+        return fit_ground_plane(points, residual_mm=residual_mm, max_trials=max_trials), "full"
+
+    total_points = int(points.shape[0])
+    sample_cap = max(200, min(total_points, int(fast_sample_cap)))
+    if sample_cap >= total_points:
+        return fit_ground_plane(points, residual_mm=residual_mm, max_trials=max_trials), "full"
+
+    step = max(1, (total_points + sample_cap - 1) // sample_cap)
+    sampled_points = points[::step][:sample_cap]
+    sampled_xy = sampled_points[:, :2]
+    sampled_z = sampled_points[:, 2]
+    sampled_min_samples = max(30, min(80, int(sampled_points.shape[0] * 0.02)))
+    sampled_trials = max(8, min(int(max_trials), int(fast_max_trials)))
+
+    sampled_inliers = _fit_ransac_inlier_mask(
+        xy=sampled_xy,
+        z=sampled_z,
+        residual_mm=float(residual_mm),
+        max_trials=sampled_trials,
+        min_samples=sampled_min_samples,
+    )
+    if sampled_inliers is not None and int(np.count_nonzero(sampled_inliers)) >= 60:
+        coeffs = _solve_plane_coefficients(sampled_xy[sampled_inliers], sampled_z[sampled_inliers])
+        if coeffs is not None:
+            a, b, c = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
+            predicted = (a * points[:, 0]) + (b * points[:, 1]) + c
+            projected_inliers = np.abs(points[:, 2] - predicted) <= float(residual_mm)
+            projected_count = int(np.count_nonzero(projected_inliers))
+            projected_ratio = float(projected_count / max(1, total_points))
+            min_ratio = max(0.05, min(1.0, float(fast_min_inlier_ratio)))
+            min_inliers = max(60, int(fast_min_inliers))
+            if projected_count >= min_inliers and projected_ratio >= min_ratio:
+                fast_model = _build_ground_plane_model(points, projected_inliers)
+                if fast_model is not None:
+                    return fast_model, "fast"
+
+    return fit_ground_plane(points, residual_mm=residual_mm, max_trials=max_trials), "fallback_full"
 
 
 def fit_ground_mask(points: np.ndarray, residual_mm: float, max_trials: int = 120) -> np.ndarray:
@@ -471,6 +564,8 @@ def find_grasp_point(
         major_max = float(np.max(proj_major))
         half_window = window_length_mm / 2.0
         best_score = -1e18
+        best_center_abs = float("inf")
+        center_bias_weight = 0.08
 
         c = major_min
         while c <= major_max:
@@ -480,9 +575,11 @@ def find_grasp_point(
                 local_minor = proj_minor[local_mask]
                 local_width = float(np.percentile(local_minor, 95) - np.percentile(local_minor, 5))
                 if local_width <= width_limit_mm:
-                    score = float(local_count) - local_width * 0.5
-                    if score > best_score:
+                    center_abs = abs(float(c))
+                    score = float(local_count) - local_width * 0.5 - center_bias_weight * center_abs
+                    if score > best_score or (abs(score - best_score) < 1e-6 and center_abs < best_center_abs):
                         best_score = score
+                        best_center_abs = center_abs
                         selected_mask = local_mask
             c += step_mm
 

@@ -31,6 +31,10 @@ struct RuntimeOptions {
     std::string endpoint    = kDefaultPubEndpoint;
     int         jpegQuality = 85;
     int         waitMs      = 100;
+    int         colorFps    = 15;
+    int         depthFps    = 30;
+    bool        frameSync   = false;
+    OBLogSeverity obLogSeverity = OB_LOG_SEVERITY_ERROR;
     enum class AlignPreference {
         Auto,
         Disable,
@@ -67,6 +71,22 @@ int readEnvInt(const char *name, int defaultValue) {
     }
 }
 
+bool readEnvBool(const char *name, bool defaultValue) {
+    const char *v = std::getenv(name);
+    if(!v) {
+        return defaultValue;
+    }
+    std::string raw = v;
+    std::transform(raw.begin(), raw.end(), raw.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if(raw == "1" || raw == "true" || raw == "yes" || raw == "on") {
+        return true;
+    }
+    if(raw == "0" || raw == "false" || raw == "no" || raw == "off") {
+        return false;
+    }
+    return defaultValue;
+}
+
 RuntimeOptions::AlignPreference parseAlignPreference(const std::string &raw) {
     std::string v = raw;
     std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -82,11 +102,58 @@ RuntimeOptions::AlignPreference parseAlignPreference(const std::string &raw) {
     return RuntimeOptions::AlignPreference::Auto;
 }
 
+OBLogSeverity parseObLogSeverity(const std::string &raw) {
+    std::string v = raw;
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if(v == "debug") {
+        return OB_LOG_SEVERITY_DEBUG;
+    }
+    if(v == "info") {
+        return OB_LOG_SEVERITY_INFO;
+    }
+    if(v == "warn" || v == "warning") {
+        return OB_LOG_SEVERITY_WARN;
+    }
+    if(v == "error") {
+        return OB_LOG_SEVERITY_ERROR;
+    }
+    if(v == "fatal") {
+        return OB_LOG_SEVERITY_FATAL;
+    }
+    if(v == "off" || v == "none") {
+        return OB_LOG_SEVERITY_OFF;
+    }
+    return OB_LOG_SEVERITY_ERROR;
+}
+
+const char *obLogSeverityToString(OBLogSeverity severity) {
+    switch(severity) {
+    case OB_LOG_SEVERITY_DEBUG:
+        return "debug";
+    case OB_LOG_SEVERITY_INFO:
+        return "info";
+    case OB_LOG_SEVERITY_WARN:
+        return "warn";
+    case OB_LOG_SEVERITY_ERROR:
+        return "error";
+    case OB_LOG_SEVERITY_FATAL:
+        return "fatal";
+    case OB_LOG_SEVERITY_OFF:
+        return "off";
+    default:
+        return "error";
+    }
+}
+
 RuntimeOptions loadOptions() {
     RuntimeOptions options;
     options.endpoint    = readEnvString("DABAI_PUB_ENDPOINT", kDefaultPubEndpoint);
     options.jpegQuality = std::max(50, std::min(95, readEnvInt("DABAI_JPEG_QUALITY", 85)));
     options.waitMs      = std::max(30, std::min(200, readEnvInt("DABAI_WAIT_MS", 100)));
+    options.colorFps    = std::max(5, std::min(30, readEnvInt("DABAI_COLOR_FPS", 15)));
+    options.depthFps    = std::max(5, std::min(30, readEnvInt("DABAI_DEPTH_FPS", 30)));
+    options.frameSync   = readEnvBool("DABAI_FRAME_SYNC", false);
+    options.obLogSeverity = parseObLogSeverity(readEnvString("DABAI_OB_LOG_LEVEL", "error"));
     options.alignPreference = parseAlignPreference(readEnvString("DABAI_ALIGN_MODE", "auto"));
     return options;
 }
@@ -108,23 +175,37 @@ std::string alignModeToString(OBAlignMode mode) {
     }
 }
 
-std::shared_ptr<ob::VideoStreamProfile> chooseColorProfile(ob::Pipeline &pipeline) {
+std::shared_ptr<ob::VideoStreamProfile> chooseColorProfile(ob::Pipeline &pipeline, int preferredFps) {
     auto colorProfiles = pipeline.getStreamProfileList(OB_SENSOR_COLOR);
     if(!colorProfiles || colorProfiles->count() == 0) {
         return nullptr;
     }
 
-    try {
-        // Prefer square input for downstream YOLO preprocessing.
-        return colorProfiles->getVideoStreamProfile(640, 640, OB_FORMAT_MJPG, 30);
-    }
-    catch(...) {
+    auto tryProfile = [&](int width, int height, int fps) -> std::shared_ptr<ob::VideoStreamProfile> {
+        try {
+            return colorProfiles->getVideoStreamProfile(width, height, OB_FORMAT_MJPG, fps);
+        }
+        catch(...) {
+            return nullptr;
+        }
+    };
+
+    if(auto profile = tryProfile(640, 640, preferredFps)) {
+        return profile;
     }
 
-    try {
-        return colorProfiles->getVideoStreamProfile(640, 480, OB_FORMAT_MJPG, 30);
+    if(auto profile = tryProfile(640, 480, preferredFps)) {
+        return profile;
     }
-    catch(...) {
+
+    if(preferredFps != 30) {
+        if(auto profile = tryProfile(640, 640, 30)) {
+            return profile;
+        }
+
+        if(auto profile = tryProfile(640, 480, 30)) {
+            return profile;
+        }
     }
 
     try {
@@ -147,7 +228,8 @@ std::shared_ptr<ob::VideoStreamProfile> chooseDepthProfile(
     const std::shared_ptr<ob::VideoStreamProfile>   &colorProfile,
     std::shared_ptr<ob::StreamProfileList>          &depthProfileList,
     OBAlignMode                                     &alignMode,
-    RuntimeOptions::AlignPreference                  alignPreference
+    RuntimeOptions::AlignPreference                  alignPreference,
+    int                                              preferredDepthFps
 ) {
     alignMode = ALIGN_DISABLE;
 
@@ -210,15 +292,33 @@ std::shared_ptr<ob::VideoStreamProfile> chooseDepthProfile(
         return nullptr;
     }
 
+    auto tryDepthAtFps = [&](int fps) -> std::shared_ptr<ob::VideoStreamProfile> {
+        try {
+            return depthProfileList->getVideoStreamProfile(OB_WIDTH_ANY, OB_HEIGHT_ANY, OB_FORMAT_Y16, fps);
+        }
+        catch(...) {
+            return nullptr;
+        }
+    };
+
+    if(auto preferred = tryDepthAtFps(preferredDepthFps)) {
+        return preferred;
+    }
+
     try {
         if(colorProfile) {
-            auto matched = depthProfileList->getVideoStreamProfile(OB_WIDTH_ANY, OB_HEIGHT_ANY, OB_FORMAT_Y16, colorProfile->fps());
-            if(matched) {
+            if(auto matched = tryDepthAtFps(colorProfile->fps())) {
                 return matched;
             }
         }
     }
     catch(...) {
+    }
+
+    if(preferredDepthFps != 30) {
+        if(auto fallback30 = tryDepthAtFps(30)) {
+            return fallback30;
+        }
     }
 
     try {
@@ -230,18 +330,30 @@ std::shared_ptr<ob::VideoStreamProfile> chooseDepthProfile(
     }
 }
 
-StreamConfigResult makeStreamConfig(ob::Pipeline &pipeline, RuntimeOptions::AlignPreference alignPreference) {
+StreamConfigResult makeStreamConfig(
+    ob::Pipeline &pipeline,
+    RuntimeOptions::AlignPreference alignPreference,
+    int preferredColorFps,
+    int preferredDepthFps
+) {
     StreamConfigResult result;
     result.config = std::make_shared<ob::Config>();
 
-    result.colorProfile = chooseColorProfile(pipeline);
+    result.colorProfile = chooseColorProfile(pipeline, preferredColorFps);
     if(!result.colorProfile) {
         throw std::runtime_error("Color stream is required for YOLO inference, but no color profile is available.");
     }
     result.config->enableStream(result.colorProfile);
 
     std::shared_ptr<ob::StreamProfileList> depthProfileList;
-    result.depthProfile = chooseDepthProfile(pipeline, result.colorProfile, depthProfileList, result.alignMode, alignPreference);
+    result.depthProfile = chooseDepthProfile(
+        pipeline,
+        result.colorProfile,
+        depthProfileList,
+        result.alignMode,
+        alignPreference,
+        preferredDepthFps
+    );
     if(!result.depthProfile) {
         throw std::runtime_error("No depth profile available.");
     }
@@ -400,7 +512,11 @@ int main() try {
     std::signal(SIGTERM, onSignal);
 
     const RuntimeOptions options = loadOptions();
-    std::cout << "[publisher] endpoint=" << options.endpoint << ", jpeg_quality=" << options.jpegQuality << ", wait_ms=" << options.waitMs << std::endl;
+    std::cout << "[publisher] endpoint=" << options.endpoint << ", jpeg_quality=" << options.jpegQuality
+              << ", wait_ms=" << options.waitMs << ", requested_color_fps=" << options.colorFps
+              << ", requested_depth_fps=" << options.depthFps
+              << ", frame_sync=" << (options.frameSync ? "on" : "off")
+              << ", ob_log_level=" << obLogSeverityToString(options.obLogSeverity) << std::endl;
 
     void *zmqContext = zmq_ctx_new();
     if(!zmqContext) {
@@ -427,7 +543,7 @@ int main() try {
         return EXIT_FAILURE;
     }
 
-    ob::Context::setLoggerSeverity(OB_LOG_SEVERITY_WARN);
+    ob::Context::setLoggerSeverity(options.obLogSeverity);
     uint64_t frameId = 0;
     bool     forceAlignDisable = false;
 
@@ -435,14 +551,16 @@ int main() try {
         try {
             ob::Pipeline pipeline;
             auto         preferredAlign = forceAlignDisable ? RuntimeOptions::AlignPreference::Disable : options.alignPreference;
-            auto         streamConfig   = makeStreamConfig(pipeline, preferredAlign);
+            auto         streamConfig   = makeStreamConfig(pipeline, preferredAlign, options.colorFps, options.depthFps);
             pipeline.start(streamConfig.config);
 
-            try {
-                pipeline.enableFrameSync();
-            }
-            catch(...) {
-                std::cout << "[publisher] frame sync unavailable, continue without sync." << std::endl;
+            if(options.frameSync) {
+                try {
+                    pipeline.enableFrameSync();
+                }
+                catch(...) {
+                    std::cout << "[publisher] frame sync unavailable, continue without sync." << std::endl;
+                }
             }
 
             const auto cameraParam = pipeline.getCameraParam();
@@ -453,11 +571,21 @@ int main() try {
 
             std::cout << "[publisher] started. align_mode=" << alignModeToString(streamConfig.alignMode) << std::endl;
             std::cout << "[publisher] color_profile="
-                      << (streamConfig.colorProfile ? std::to_string(streamConfig.colorProfile->width()) + "x" + std::to_string(streamConfig.colorProfile->height()) : "none")
-                      << ", depth_profile=" << streamConfig.depthProfile->width() << "x" << streamConfig.depthProfile->height() << std::endl;
+                      << (streamConfig.colorProfile
+                              ? std::to_string(streamConfig.colorProfile->width()) + "x" + std::to_string(streamConfig.colorProfile->height()) + "@"
+                                    + std::to_string(streamConfig.colorProfile->fps())
+                              : "none")
+                      << ", depth_profile=" << streamConfig.depthProfile->width() << "x" << streamConfig.depthProfile->height() << "@"
+                      << streamConfig.depthProfile->fps() << std::endl;
+            if(streamConfig.colorProfile && streamConfig.colorProfile->fps() != options.colorFps) {
+                std::cout << "[publisher] requested_color_fps=" << options.colorFps << " not available, fallback_to="
+                          << streamConfig.colorProfile->fps() << std::endl;
+            }
+            if(streamConfig.depthProfile && streamConfig.depthProfile->fps() != options.depthFps) {
+                std::cout << "[publisher] requested_depth_fps=" << options.depthFps << " not available, fallback_to="
+                          << streamConfig.depthProfile->fps() << std::endl;
+            }
 
-            auto lastLogTs = std::chrono::steady_clock::now();
-            int  sentCount = 0;
             int  zeroDepthStreak = 0;
             bool shouldRestartWithoutAlign = false;
 
@@ -519,13 +647,6 @@ int main() try {
                     break;
                 }
 
-                sentCount += 1;
-                auto now = std::chrono::steady_clock::now();
-                if(std::chrono::duration_cast<std::chrono::seconds>(now - lastLogTs).count() >= 1) {
-                    std::cout << "[publisher] sent_fps~" << sentCount << ", last_frame_id=" << frameId << std::endl;
-                    sentCount = 0;
-                    lastLogTs = now;
-                }
             }
 
             pipeline.stop();

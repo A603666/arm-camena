@@ -21,7 +21,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 import yaml
 
 JOINT_NAMES = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
-THREEPOINT_ROUTE = ["ready", "pick", "transport", "dump"]
+THREEPOINT_CONFIG_ROUTE = ["ready", "pick", "transport", "dump"]
+THREEPOINT_EXEC_ROUTE = ["ready", "prepick", "pick", "transport", "dump"]
+PREPICK_OFFSET_M = 0.05
 
 
 def clamp(val: float, low: float, high: float) -> float:
@@ -635,8 +637,8 @@ class NeroArmTester:
         self.min_joint7_rad = math.radians(self.min_joint7_deg)
         if self.lock_orientation_from in ("scan",):
             self.lock_orientation_from = "ready"
-        if self.lock_orientation_from not in THREEPOINT_ROUTE:
-            raise ValueError(f"threepoint.lock_orientation_from must be one of {THREEPOINT_ROUTE}")
+        if self.lock_orientation_from not in THREEPOINT_CONFIG_ROUTE:
+            raise ValueError(f"threepoint.lock_orientation_from must be one of {THREEPOINT_CONFIG_ROUTE}")
         if self.transfer_motion not in ("p", "l"):
             raise ValueError("threepoint.transfer_motion must be 'p' or 'l'")
         if self.approach_motion not in ("p", "l"):
@@ -663,6 +665,8 @@ class NeroArmTester:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if not isinstance(raw, dict):
             raise ValueError(f"config root must be a mapping: {path}")
+        if isinstance(raw.get("robot_runtime"), dict):
+            raw = dict(raw.get("robot_runtime"))
 
         def resolve_value(value):
             if not isinstance(value, str) or not value.strip():
@@ -1213,6 +1217,10 @@ class NeroArmTester:
         ready_pose_m_rad = self._pose_mm_deg_to_m_rad(ready_pose_mm_deg)
         pick_pose_m_rad = self._pose_mm_deg_to_m_rad(pick_pose_mm_deg)
         dump_pose_m_rad = self._pose_mm_deg_to_m_rad(dump_pose_mm_deg)
+        prepick_pose_m_rad = list(pick_pose_m_rad)
+        prepick_pose_m_rad[2] = float(prepick_pose_m_rad[2]) + PREPICK_OFFSET_M
+        prepick_pose_mm_deg = list(pick_pose_mm_deg)
+        prepick_pose_mm_deg[2] = float(prepick_pose_mm_deg[2]) + PREPICK_OFFSET_M * 1000.0
 
         transport_deg = transport_cfg.get("joints_deg") if isinstance(transport_cfg, dict) else None
         transport_pose_mm_deg = self._pose_map_to_list(
@@ -1265,6 +1273,13 @@ class NeroArmTester:
                 "pose_m_rad": ready_pose_m_rad,
                 "locked_pose_m_rad": as_locked_pose(ready_pose_m_rad),
             },
+            "prepick": {
+                "joints_rad": pick_rad,
+                "joints_deg": [float(v) for v in pick_deg],
+                "pose_mm_deg": prepick_pose_mm_deg,
+                "pose_m_rad": prepick_pose_m_rad,
+                "locked_pose_m_rad": as_locked_pose(prepick_pose_m_rad),
+            },
             "pick": {
                 "joints_rad": pick_rad,
                 "joints_deg": [float(v) for v in pick_deg],
@@ -1288,14 +1303,14 @@ class NeroArmTester:
             },
         }
 
-        for name in THREEPOINT_ROUTE:
+        for name in THREEPOINT_CONFIG_ROUTE:
             self._check_joint7_target(info[name]["joints_rad"], f"threepoint.{name}")
 
         self.threepoint_info = info
 
         overwrite = bool(tp.get("overwrite_waypoints_on_start", True))
         if overwrite:
-            for name in THREEPOINT_ROUTE:
+            for name in THREEPOINT_CONFIG_ROUTE:
                 self.store.set(name, list(info[name]["joints_rad"]), None)
             self.store.save()
 
@@ -1337,8 +1352,8 @@ class NeroArmTester:
             print("[ERR] threepoint config not loaded")
             return
 
-        print("Four-point plan:")
-        for name in THREEPOINT_ROUTE:
+        print("Five-point plan (prepick derived from pick +50mm Z):")
+        for name in THREEPOINT_EXEC_ROUTE:
             info = self.threepoint_info[name]
             degs = info["joints_deg"]
             rads = info["joints_rad"]
@@ -1460,7 +1475,7 @@ class NeroArmTester:
             self.approach_motion,
         )
         pose_key = self._active_pose_key()
-        for name in THREEPOINT_ROUTE:
+        for name in THREEPOINT_EXEC_ROUTE:
             info = self.threepoint_info.get(name, {})
             pose = info.get(pose_key)
             if not isinstance(pose, list) or len(pose) != 6:
@@ -1478,7 +1493,8 @@ class NeroArmTester:
         steps: List[Tuple[str, Callable[[], bool]]] = [
             ("move ready", lambda: self._move_threepoint_pose("ready", "move ready", self.transfer_motion)),
             ("open gripper (ready)", lambda: self.backend.open_gripper(open_width, force)),
-            ("move pick", lambda: self._move_threepoint_pose("pick", "move pick", self.approach_motion)),
+            ("move prepick", lambda: self._move_threepoint_pose("prepick", "move prepick", "p")),
+            ("move pick", lambda: self._move_threepoint_pose("pick", "move pick", "l")),
             ("close gripper", lambda: self.backend.close_gripper(close_width, force)),
             (f"save closed state {save_name}", lambda: self._save_runtime_state(save_name)),
             (
@@ -1662,7 +1678,7 @@ class NeroArmTester:
         ok = True
         pose_key = self._active_pose_key()
 
-        for name in THREEPOINT_ROUTE:
+        for name in THREEPOINT_EXEC_ROUTE:
             info = self.threepoint_info.get(name, {})
             pose = info.get(pose_key)
             joints = info.get("joints_rad")
@@ -1873,6 +1889,10 @@ class NeroArmTester:
 
 
 def default_config_path() -> Path:
+    root_dir = Path(__file__).resolve().parents[1]
+    unified = root_dir / "pipeline_config.yaml"
+    if unified.is_file():
+        return unified
     return Path(__file__).resolve().parent / "config" / "default.yaml"
 
 

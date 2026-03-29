@@ -12,10 +12,12 @@ MODEL_DIR="${ROOT_DIR}/camera_runtime"
 DEFAULT_PT_MODEL="${MODEL_DIR}/yolo26n.pt"
 CUSPARSELT_LIB_DIR=""
 TORCH_LIB_DIR=""
+DEFAULT_UNIFIED_CONFIG="${ROOT_DIR}/pipeline_config.yaml"
 
 publisher_pid=""
 service_pid=""
 cleanup_done=0
+using_unified_config=false
 
 require_command() {
     local cmd="$1"
@@ -23,6 +25,148 @@ require_command() {
         echo "[vision] missing command: ${cmd}" >&2
         exit 1
     fi
+}
+
+is_positive_int() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_nonnegative_number() {
+    [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+load_unified_vision_env_if_needed() {
+    local config_path="$1"
+    local loader_path="${ROOT_DIR}/scripts/unified_config_loader.py"
+    local detected=""
+    local line key value
+
+    if [[ ! -f "${config_path}" ]]; then
+        return 0
+    fi
+    if [[ ! -f "${loader_path}" ]]; then
+        return 0
+    fi
+
+    detected="$(python3 "${loader_path}" --config "${config_path}" --mode detect 2>/dev/null || true)"
+    if [[ "${detected}" != "unified" ]]; then
+        return 0
+    fi
+
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        if [[ "${line}" != *=* ]]; then
+            continue
+        fi
+        key="${line%%=*}"
+        value="${line#*=}"
+        if [[ -z "${key}" ]]; then
+            continue
+        fi
+        if [[ -z "${!key+x}" ]]; then
+            export "${key}=${value}"
+        fi
+    done < <(python3 "${loader_path}" --config "${config_path}" --mode vision-env)
+
+    using_unified_config=true
+    echo "[vision] loaded unified config: ${config_path}"
+}
+
+resolve_auto_enable_config_for_daemon() {
+    local requested_config="$1"
+    local loader_path="${ROOT_DIR}/scripts/unified_config_loader.py"
+    local fallback_config="${ROOT_DIR}/robot_runtime/config/auto_enable.yaml"
+
+    if [[ -f "${requested_config}" && -f "${loader_path}" ]]; then
+        if python3 "${loader_path}" --config "${requested_config}" --mode component --component auto_enable >/dev/null 2>&1; then
+            printf '%s\n' "${requested_config}"
+            return 0
+        fi
+    fi
+
+    printf '%s\n' "${fallback_config}"
+}
+
+prepare_robot_can() {
+    local daemon_path="${ROOT_DIR}/robot_runtime/nero_auto_enable_daemon.py"
+    local daemon_config=""
+    local rc=0
+    local max_attempts="${DABAI_AUTO_ENABLE_ONCE_MAX_ATTEMPTS:-3}"
+    local retry_delay_sec="${DABAI_AUTO_ENABLE_ONCE_RETRY_DELAY_SEC:-2.0}"
+    local attempt=1
+
+    if [[ "${DABAI_ROBOT_CONTROL_ENABLED}" != "1" ]]; then
+        echo "[vision] robot control disabled, skip robot CAN preparation."
+        return 0
+    fi
+
+    if [[ ! -f "${daemon_path}" ]]; then
+        echo "[vision] auto-enable daemon not found: ${daemon_path}" >&2
+        exit 1
+    fi
+
+    daemon_config="$(resolve_auto_enable_config_for_daemon "${config_path}")"
+    daemon_config="$(realpath -m "${daemon_config}")"
+    if [[ ! -f "${daemon_config}" ]]; then
+        echo "[vision] auto-enable config not found: ${daemon_config}" >&2
+        exit 1
+    fi
+
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "[vision] missing command: sudo" >&2
+        exit 1
+    fi
+
+    echo "[vision] prepare robot can..."
+    echo "[vision] auto-enable config: ${daemon_config}"
+
+    if ! is_positive_int "${max_attempts}"; then
+        echo "[vision] invalid DABAI_AUTO_ENABLE_ONCE_MAX_ATTEMPTS=${max_attempts} (must be >=1 integer)" >&2
+        exit 2
+    fi
+    if ! is_nonnegative_number "${retry_delay_sec}"; then
+        echo "[vision] invalid DABAI_AUTO_ENABLE_ONCE_RETRY_DELAY_SEC=${retry_delay_sec} (must be >=0 number)" >&2
+        exit 2
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet nero-auto-enable.service; then
+            echo "[vision] nero-auto-enable.service is active; skip local --once auto-enable to avoid CAN controller conflict."
+            return 0
+        fi
+    fi
+
+    if [[ "${EUID}" -ne 0 ]]; then
+        if ! sudo -v; then
+            echo "[vision] auto-enable once failed: sudo auth failed" >&2
+            exit 1
+        fi
+    fi
+
+    while (( attempt <= max_attempts )); do
+        set +e
+        python3 "${daemon_path}" --config "${daemon_config}" --once
+        rc=$?
+        set -e
+
+        if [[ "${rc}" -eq 0 ]]; then
+            if (( max_attempts > 1 )); then
+                echo "[vision] auto-enable once passed (attempt ${attempt}/${max_attempts})"
+            else
+                echo "[vision] auto-enable once passed"
+            fi
+            return 0
+        fi
+
+        if (( attempt < max_attempts )); then
+            echo "[vision] auto-enable once attempt ${attempt}/${max_attempts} failed (rc=${rc}), retry in ${retry_delay_sec}s..."
+            sleep "${retry_delay_sec}"
+        fi
+        ((attempt++))
+    done
+
+    echo "[vision] auto-enable once failed after ${max_attempts} attempts (last rc=${rc})" >&2
+    exit "${rc}"
 }
 
 resolve_default_model_path() {
@@ -109,15 +253,21 @@ find_project_service_pids() {
         pid="${proc##*/}"
         [[ "${pid}" == "$$" ]] && continue
 
-        cwd="$(readlink -f "${proc}/cwd" 2>/dev/null || true)"
-        if [[ "${cwd}" != "${VISION_DIR}" ]]; then
+        if [[ ! -r "${proc}/cmdline" ]]; then
+            continue
+        fi
+        cmdline="$(cat "${proc}/cmdline" 2>/dev/null | tr '\0' ' ' || true)"
+        [[ -z "${cmdline}" ]] && continue
+        if [[ "${cmdline}" != *"run_service.py"* ]]; then
             continue
         fi
 
-        cmdline="$(tr '\0' ' ' < "${proc}/cmdline" 2>/dev/null || true)"
-        if [[ "${cmdline}" == *"run_service.py"* ]]; then
-            printf '%s\n' "${pid}"
+        cwd="$(readlink -f "${proc}/cwd" 2>/dev/null || true)"
+        if [[ "${cwd}" != "${VISION_DIR}" && "${cmdline}" != *"${VISION_DIR}/run_service.py"* ]]; then
+            continue
         fi
+
+        printf '%s\n' "${pid}"
     done
 }
 
@@ -132,6 +282,20 @@ find_project_publisher_pids() {
             printf '%s\n' "${pid}"
         fi
     done
+}
+
+publisher_needs_rebuild() {
+    local publisher_bin="$1"
+    if [[ ! -x "${publisher_bin}" ]]; then
+        return 0
+    fi
+    if [[ ! -f "${BUILD_DIR}/Makefile" ]]; then
+        return 0
+    fi
+    if find "${PUBLISHER_DIR}/src" "${PUBLISHER_DIR}/CMakeLists.txt" -type f -newer "${publisher_bin}" -print -quit | grep -q .; then
+        return 0
+    fi
+    return 1
 }
 
 terminate_stale_processes() {
@@ -166,6 +330,8 @@ terminate_stale_processes() {
 
 check_only=false
 allow_lan_robot_control=false
+config_path="${DEFAULT_UNIFIED_CONFIG}"
+config_provided=false
 while (( "$#" > 0 )); do
     case "$1" in
         --check)
@@ -174,23 +340,39 @@ while (( "$#" > 0 )); do
         --allow-lan-robot-control)
             allow_lan_robot_control=true
             ;;
+        --config)
+            if (( "$#" < 2 )); then
+                echo "[vision] --config requires a path argument" >&2
+                exit 2
+            fi
+            config_path="$2"
+            config_provided=true
+            shift
+            ;;
         -h|--help)
             cat <<'EOF'
-Usage: ./scripts/start_vision_arm64.sh [--check] [--allow-lan-robot-control]
+Usage: ./scripts/start_vision_arm64.sh [--check] [--allow-lan-robot-control] [--config PATH]
 
   --check                      Check dependencies and resolved runtime config only.
   --allow-lan-robot-control    Allow robot control API access from LAN clients.
+  --config PATH                Config path (default: ./pipeline_config.yaml if present).
 EOF
             exit 0
             ;;
         *)
             echo "[vision] unknown argument: $1" >&2
-            echo "[vision] supported arguments: --check, --allow-lan-robot-control" >&2
+            echo "[vision] supported arguments: --check, --allow-lan-robot-control, --config PATH" >&2
             exit 2
             ;;
     esac
     shift
 done
+
+config_path="$(realpath -m "${config_path}")"
+if [[ "${config_provided}" == "true" && ! -f "${config_path}" ]]; then
+    echo "[vision] config file not found: ${config_path}" >&2
+    exit 2
+fi
 
 trap on_exit EXIT
 trap 'on_signal INT' INT
@@ -271,6 +453,8 @@ then
     exit 1
 fi
 
+load_unified_vision_env_if_needed "${config_path}"
+
 selected_model="${DABAI_YOLO_MODEL:-}"
 if [[ -z "${selected_model}" ]]; then
     selected_model="$(resolve_default_model_path "${MODEL_DIR}" "${DEFAULT_PT_MODEL}")"
@@ -289,12 +473,49 @@ fi
 export DABAI_YOLO_MODEL="${selected_model}"
 export DABAI_WEB_PORT="${DABAI_WEB_PORT:-18000}"
 export DABAI_YOLO_DEVICE="${DABAI_YOLO_DEVICE:-cuda:0}"
+export DABAI_YOLO_IMGSZ="${DABAI_YOLO_IMGSZ:-512}"
 export DABAI_YOLO_PRECISION="${DABAI_YOLO_PRECISION:-fp32}"
 export DABAI_YOLO_WARMUP="${DABAI_YOLO_WARMUP:-1}"
-export DABAI_GEOM_BACKEND="${DABAI_GEOM_BACKEND:-auto}"
+export DABAI_GEOM_BACKEND="${DABAI_GEOM_BACKEND:-cpu}"
 export DABAI_GEOM_PARITY_CHECK="${DABAI_GEOM_PARITY_CHECK:-0}"
 export DABAI_GEOM_PARITY_EVERY_N="${DABAI_GEOM_PARITY_EVERY_N:-30}"
+export DABAI_INFER_EVERY_N="${DABAI_INFER_EVERY_N:-2}"
+export DABAI_GEOMETRY_EVERY_N="${DABAI_GEOMETRY_EVERY_N:-1}"
+export DABAI_MAX_POINTS_FOR_GEOMETRY="${DABAI_MAX_POINTS_FOR_GEOMETRY:-12000}"
+export DABAI_GROUND_FIT_FAST_ENABLED="${DABAI_GROUND_FIT_FAST_ENABLED:-1}"
+export DABAI_GROUND_FIT_FAST_SAMPLE_CAP="${DABAI_GROUND_FIT_FAST_SAMPLE_CAP:-2500}"
+export DABAI_GROUND_FIT_FAST_MAX_TRIALS="${DABAI_GROUND_FIT_FAST_MAX_TRIALS:-40}"
+export DABAI_GROUND_FIT_FAST_MIN_INLIER_RATIO="${DABAI_GROUND_FIT_FAST_MIN_INLIER_RATIO:-0.55}"
+export DABAI_GROUND_FIT_FAST_MIN_INLIERS="${DABAI_GROUND_FIT_FAST_MIN_INLIERS:-80}"
+export DABAI_COLOR_FPS="${DABAI_COLOR_FPS:-15}"
+export DABAI_DEPTH_FPS="${DABAI_DEPTH_FPS:-30}"
+export DABAI_ALIGN_MODE="${DABAI_ALIGN_MODE:-disable}"
+export DABAI_FRAME_SYNC="${DABAI_FRAME_SYNC:-0}"
+export DABAI_OB_LOG_LEVEL="${DABAI_OB_LOG_LEVEL:-error}"
+export DABAI_UVICORN_LOG_LEVEL="${DABAI_UVICORN_LOG_LEVEL:-warning}"
+export DABAI_UVICORN_ACCESS_LOG="${DABAI_UVICORN_ACCESS_LOG:-0}"
+export DABAI_SKIP_BUILD="${DABAI_SKIP_BUILD:-1}"
+export DABAI_FORCE_REBUILD="${DABAI_FORCE_REBUILD:-0}"
+export DABAI_TARGET_LOCK_IOU_MIN="${DABAI_TARGET_LOCK_IOU_MIN:-0.45}"
+export DABAI_TARGET_LOCK_HITS="${DABAI_TARGET_LOCK_HITS:-2}"
+export DABAI_TARGET_LOST_HOLD_FRAMES="${DABAI_TARGET_LOST_HOLD_FRAMES:-6}"
+export DABAI_TARGET_MAX_CENTER_JUMP_PX="${DABAI_TARGET_MAX_CENTER_JUMP_PX:-80}"
+export DABAI_TARGET_MAX_DEPTH_JUMP_MM="${DABAI_TARGET_MAX_DEPTH_JUMP_MM:-80}"
+export DABAI_SUPPORT_SWITCH_HOLD_FRAMES="${DABAI_SUPPORT_SWITCH_HOLD_FRAMES:-3}"
+export DABAI_DEPTH_VALID_RATIO_MIN="${DABAI_DEPTH_VALID_RATIO_MIN:-0.03}"
+export DABAI_SUPPORT_POINTS_MIN="${DABAI_SUPPORT_POINTS_MIN:-180}"
+export DABAI_SUPPORT_FILL_RATIO_MIN="${DABAI_SUPPORT_FILL_RATIO_MIN:-0.02}"
+export DABAI_GROUND_RATIO_MAX="${DABAI_GROUND_RATIO_MAX:-0.96}"
+export DABAI_QUALITY_SCORE_MIN="${DABAI_QUALITY_SCORE_MIN:-0.50}"
+export DABAI_GRASP_POINT_SMOOTH_ALPHA="${DABAI_GRASP_POINT_SMOOTH_ALPHA:-0.20}"
+export DABAI_GRASP_YAW_SMOOTH_ALPHA="${DABAI_GRASP_YAW_SMOOTH_ALPHA:-0.20}"
+export DABAI_GRASP_HOLD_FRAMES="${DABAI_GRASP_HOLD_FRAMES:-7}"
+export DABAI_GRASP_JUMP_XY_MM="${DABAI_GRASP_JUMP_XY_MM:-22}"
+export DABAI_GRASP_JUMP_Z_MM="${DABAI_GRASP_JUMP_Z_MM:-22}"
+export DABAI_GRASP_JUMP_YAW_DEG="${DABAI_GRASP_JUMP_YAW_DEG:-20}"
 export DABAI_ROBOT_CONTROL_ENABLED="${DABAI_ROBOT_CONTROL_ENABLED:-1}"
+export DABAI_AUTO_ENABLE_ONCE_MAX_ATTEMPTS="${DABAI_AUTO_ENABLE_ONCE_MAX_ATTEMPTS:-3}"
+export DABAI_AUTO_ENABLE_ONCE_RETRY_DELAY_SEC="${DABAI_AUTO_ENABLE_ONCE_RETRY_DELAY_SEC:-2.0}"
 robot_loopback_only="${DABAI_ROBOT_LOOPBACK_ONLY:-1}"
 if [[ "${allow_lan_robot_control}" == "true" ]]; then
     robot_loopback_only="0"
@@ -322,32 +543,90 @@ if [[ "${DABAI_ROBOT_LOOPBACK_ONLY}" == "0" ]]; then
     echo "[vision] WARNING: robot control API is not loopback-only; LAN clients can send robot commands."
 fi
 
+config_mode="legacy"
+if [[ "${using_unified_config}" == "true" ]]; then
+    config_mode="unified"
+fi
+
 if [[ "${check_only}" == "true" ]]; then
     echo "[vision] check passed"
     echo "  root=${ROOT_DIR}"
+    echo "  config=${config_path}"
+    echo "  config_mode=${config_mode}"
     echo "  model=${DABAI_YOLO_MODEL}"
     echo "  sdk_lib=${SDK_LIB_DIR}"
     echo "  web_port=${DABAI_WEB_PORT}"
     echo "  yolo_device=${DABAI_YOLO_DEVICE}"
+    echo "  yolo_imgsz=${DABAI_YOLO_IMGSZ}"
     echo "  yolo_precision=${DABAI_YOLO_PRECISION}"
     echo "  geom_backend=${DABAI_GEOM_BACKEND}"
     echo "  geom_parity_check=${DABAI_GEOM_PARITY_CHECK}"
     echo "  geom_parity_every_n=${DABAI_GEOM_PARITY_EVERY_N}"
+    echo "  infer_every_n=${DABAI_INFER_EVERY_N}"
+    echo "  geometry_every_n=${DABAI_GEOMETRY_EVERY_N}"
+    echo "  max_points_for_geometry=${DABAI_MAX_POINTS_FOR_GEOMETRY}"
+    echo "  ground_fit_fast_enabled=${DABAI_GROUND_FIT_FAST_ENABLED}"
+    echo "  ground_fit_fast_sample_cap=${DABAI_GROUND_FIT_FAST_SAMPLE_CAP}"
+    echo "  ground_fit_fast_max_trials=${DABAI_GROUND_FIT_FAST_MAX_TRIALS}"
+    echo "  ground_fit_fast_min_inlier_ratio=${DABAI_GROUND_FIT_FAST_MIN_INLIER_RATIO}"
+    echo "  ground_fit_fast_min_inliers=${DABAI_GROUND_FIT_FAST_MIN_INLIERS}"
+    echo "  color_fps=${DABAI_COLOR_FPS}"
+    echo "  depth_fps=${DABAI_DEPTH_FPS}"
+    echo "  align_mode=${DABAI_ALIGN_MODE}"
+    echo "  frame_sync=${DABAI_FRAME_SYNC}"
+    echo "  ob_log_level=${DABAI_OB_LOG_LEVEL}"
+    echo "  uvicorn_log_level=${DABAI_UVICORN_LOG_LEVEL}"
+    echo "  uvicorn_access_log=${DABAI_UVICORN_ACCESS_LOG}"
+    echo "  skip_build=${DABAI_SKIP_BUILD}"
+    echo "  force_rebuild=${DABAI_FORCE_REBUILD}"
+    echo "  target_lock_iou_min=${DABAI_TARGET_LOCK_IOU_MIN}"
+    echo "  target_lock_hits=${DABAI_TARGET_LOCK_HITS}"
+    echo "  target_lost_hold_frames=${DABAI_TARGET_LOST_HOLD_FRAMES}"
+    echo "  target_max_center_jump_px=${DABAI_TARGET_MAX_CENTER_JUMP_PX}"
+    echo "  target_max_depth_jump_mm=${DABAI_TARGET_MAX_DEPTH_JUMP_MM}"
+    echo "  support_switch_hold_frames=${DABAI_SUPPORT_SWITCH_HOLD_FRAMES}"
+    echo "  depth_valid_ratio_min=${DABAI_DEPTH_VALID_RATIO_MIN}"
+    echo "  support_points_min=${DABAI_SUPPORT_POINTS_MIN}"
+    echo "  support_fill_ratio_min=${DABAI_SUPPORT_FILL_RATIO_MIN}"
+    echo "  ground_ratio_max=${DABAI_GROUND_RATIO_MAX}"
+    echo "  quality_score_min=${DABAI_QUALITY_SCORE_MIN}"
+    echo "  grasp_point_smooth_alpha=${DABAI_GRASP_POINT_SMOOTH_ALPHA}"
+    echo "  grasp_yaw_smooth_alpha=${DABAI_GRASP_YAW_SMOOTH_ALPHA}"
+    echo "  grasp_hold_frames=${DABAI_GRASP_HOLD_FRAMES}"
+    echo "  grasp_jump_xy_mm=${DABAI_GRASP_JUMP_XY_MM}"
+    echo "  grasp_jump_z_mm=${DABAI_GRASP_JUMP_Z_MM}"
+    echo "  grasp_jump_yaw_deg=${DABAI_GRASP_JUMP_YAW_DEG}"
     echo "  robot_control_enabled=${DABAI_ROBOT_CONTROL_ENABLED}"
+    echo "  auto_enable_once_max_attempts=${DABAI_AUTO_ENABLE_ONCE_MAX_ATTEMPTS}"
+    echo "  auto_enable_once_retry_delay_sec=${DABAI_AUTO_ENABLE_ONCE_RETRY_DELAY_SEC}"
     echo "  robot_loopback_only=${DABAI_ROBOT_LOOPBACK_ONLY}"
     echo "  robot_config=${DABAI_ROBOT_CONFIG}"
     exit 0
 fi
 
 terminate_stale_processes
+prepare_robot_can
 
 build_jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
-
-echo "[vision] building ARM64 publisher..."
-cmake -S "${PUBLISHER_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release
-cmake --build "${BUILD_DIR}" --config Release -j"${build_jobs}"
-
 publisher_bin="${BUILD_DIR}/dabai_frame_publisher"
+
+should_build=0
+if [[ "${DABAI_FORCE_REBUILD}" == "1" ]]; then
+    should_build=1
+elif [[ "${DABAI_SKIP_BUILD}" != "1" ]]; then
+    should_build=1
+elif publisher_needs_rebuild "${publisher_bin}"; then
+    should_build=1
+fi
+
+if [[ "${should_build}" == "1" ]]; then
+    echo "[vision] building ARM64 publisher..."
+    cmake -S "${PUBLISHER_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release
+    cmake --build "${BUILD_DIR}" --config Release -j"${build_jobs}"
+else
+    echo "[vision] publisher binary is up-to-date, skip build."
+fi
+
 if [[ ! -x "${publisher_bin}" ]]; then
     echo "[vision] publisher executable not found: ${publisher_bin}" >&2
     exit 1

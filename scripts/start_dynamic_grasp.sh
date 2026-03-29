@@ -4,7 +4,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CONFIG_PATH="${ROOT_DIR}/dynamic_grasp_config.yaml"
+UNIFIED_CONFIG_PATH="${ROOT_DIR}/pipeline_config.yaml"
+LEGACY_CONFIG_PATH="${ROOT_DIR}/dynamic_grasp_config.yaml"
+
+if [[ -f "${UNIFIED_CONFIG_PATH}" ]]; then
+    CONFIG_PATH="${UNIFIED_CONFIG_PATH}"
+else
+    CONFIG_PATH="${LEGACY_CONFIG_PATH}"
+fi
 
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 

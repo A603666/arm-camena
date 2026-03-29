@@ -33,7 +33,10 @@ def make_snapshot(
     y_mm: float,
     z_mm: float = 760.0,
     axis_dir: tuple[float, float, float] = (1.0, 0.0, 0.0),
+    yaw_deg: float = 0.0,
     status: str = "ok",
+    quality_score: float = 0.8,
+    quality_flags: tuple[str, ...] = (),
 ) -> VisionSnapshot:
     grasp_point = None if status != "ok" else (x_mm / 1000.0, y_mm / 1000.0, z_mm / 1000.0)
     axis = None if status != "ok" else axis_dir
@@ -44,7 +47,22 @@ def make_snapshot(
         axis_dir_optical=axis,
         target_center_depth_m=z_mm / 1000.0 if status == "ok" else None,
         width_m=0.03 if status == "ok" else None,
-        raw={"status": status},
+        source_quality_score=quality_score if status == "ok" else None,
+        quality_flags=quality_flags if status == "ok" else (),
+        raw=(
+            {
+                "status": status,
+                "grasp": {
+                    "yaw_deg": yaw_deg,
+                },
+                "segmentation": {
+                    "quality_score": quality_score,
+                    "quality_flags": list(quality_flags),
+                },
+            }
+            if status == "ok"
+            else {"status": status}
+        ),
     )
 
 
@@ -176,17 +194,29 @@ class FakeRobot:
         return self.recover_success
 
 
-def make_config() -> AppConfig:
+def make_config(*, plan_buffer_frames: int = 3, max_replan_jump_mm: float = 2000.0) -> AppConfig:
     return AppConfig(
         config_path=Path("/tmp/dynamic_grasp_test.yaml"),
-        vision=VisionConfig(base_url="http://mock", poll_hz=50.0, health_timeout_sec=0.1, target_stable_frames=1),
+        vision=VisionConfig(
+            base_url="http://mock",
+            poll_hz=50.0,
+            health_timeout_sec=0.1,
+            target_stable_frames=1,
+            stable_pos_tol_mm=5.0,
+            stable_z_tol_mm=5.0,
+            stable_yaw_tol_deg=5.0,
+            plan_buffer_frames=plan_buffer_frames,
+            max_replan_jump_mm=max_replan_jump_mm,
+            min_quality_score=0.5,
+            reject_on_quality_drop=True,
+        ),
         handeye=HandEyeConfig(mode="nominal", extrinsics_path=Path("/tmp/handeye.yaml")),
         scan=ScanConfig(max_offset_xy_m=0.18, max_step_xy_m=0.05, converge_tol_mm=5.0, lost_target_timeout_sec=0.03),
         grasp=GraspConfig(
             open_width_m=0.05,
             close_width_m=0.0,
             force_n=1.0,
-            hover_clearance_m=0.05,
+            prepick_offset_m=0.05,
             final_z_offset_m=0.0,
             max_descent_m=0.35,
             min_safe_z_m=0.10,
@@ -220,12 +250,12 @@ def make_identity_handeye() -> HandEyeModel:
 
 
 class DynamicGraspControllerTests(unittest.TestCase):
-    def _make_controller(self, robot: FakeRobot, vision: FakeVisionClient) -> DynamicGraspController:
+    def _make_controller(self, robot: FakeRobot, vision: FakeVisionClient, config: AppConfig | None = None) -> DynamicGraspController:
         logger = logging.getLogger(f"dynamic_grasp_test_{id(robot)}")
         logger.handlers.clear()
         logger.addHandler(logging.NullHandler())
         controller = DynamicGraspController(
-            config=make_config(),
+            config=config or make_config(),
             robot=robot,
             vision_client=vision,
             handeye=make_identity_handeye(),
@@ -240,11 +270,7 @@ class DynamicGraspControllerTests(unittest.TestCase):
         centered = make_snapshot(x_mm=1.0, y_mm=1.0)
         vision = FakeVisionClient(
             [
-                centered,
-                centered,
-                centered,
-                centered,
-                centered,
+                *([centered] * 12),
             ]
         )
         controller = self._make_controller(robot, vision)
@@ -262,11 +288,7 @@ class DynamicGraspControllerTests(unittest.TestCase):
         centered = make_snapshot(x_mm=0.5, y_mm=0.5)
         vision = FakeVisionClient(
             [
-                centered,
-                centered,
-                centered,
-                centered,
-                centered,
+                *([centered] * 12),
             ]
         )
         controller = self._make_controller(robot, vision)
@@ -301,6 +323,88 @@ class DynamicGraspControllerTests(unittest.TestCase):
         self.assertTrue(move_actions)
         chosen_yaw = move_actions[-1][1][5]
         self.assertAlmostEqual(chosen_yaw, 3.1416, places=3)
+
+    def test_snapshot_within_tolerance_uses_position_and_yaw_threshold(self) -> None:
+        robot = FakeRobot()
+        vision = FakeVisionClient([])
+        controller = self._make_controller(robot, vision)
+
+        base = make_snapshot(x_mm=10.0, y_mm=10.0, z_mm=760.0, yaw_deg=0.0)
+        near = make_snapshot(x_mm=12.0, y_mm=11.0, z_mm=763.0, yaw_deg=3.0)
+        far = make_snapshot(x_mm=20.0, y_mm=10.0, z_mm=760.0, yaw_deg=0.0)
+        yaw_far = make_snapshot(x_mm=12.0, y_mm=11.0, z_mm=763.0, yaw_deg=12.0)
+
+        self.assertTrue(controller._snapshot_within_tolerance(base, near))
+        self.assertFalse(controller._snapshot_within_tolerance(base, far))
+        self.assertFalse(controller._snapshot_within_tolerance(base, yaw_far))
+
+    def test_wait_for_trackable_target_rejects_low_quality_snapshots(self) -> None:
+        robot = FakeRobot()
+        low = make_snapshot(x_mm=10.0, y_mm=10.0, quality_score=0.2, quality_flags=("depth_valid_ratio",))
+        good = make_snapshot(x_mm=10.5, y_mm=9.8, quality_score=0.8)
+        vision = FakeVisionClient([low, low, good])
+        controller = self._make_controller(robot, vision)
+
+        snapshot = controller._wait_for_trackable_target(timeout_sec=0.2, stable_required=1)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertGreaterEqual(snapshot.source_quality_score or 0.0, 0.5)
+
+    def test_buffered_target_plan_fuses_samples_and_rejects_large_replan_jump(self) -> None:
+        robot = FakeRobot()
+        vision = FakeVisionClient([])
+        config = make_config(plan_buffer_frames=3, max_replan_jump_mm=15.0)
+        controller = self._make_controller(robot, vision, config=config)
+        controller.ready_tcp_pose = list(robot.current_tcp)
+
+        seed = make_snapshot(x_mm=10.0, y_mm=8.0, z_mm=760.0, yaw_deg=0.0)
+        samples = iter(
+            [
+                make_snapshot(x_mm=10.5, y_mm=8.3, z_mm=760.0, yaw_deg=1.0),
+                make_snapshot(x_mm=9.7, y_mm=7.9, z_mm=760.0, yaw_deg=-1.0),
+            ]
+        )
+        controller._wait_for_trackable_target = lambda timeout_sec, stable_required=1: next(samples, None)  # type: ignore[method-assign]
+        fused = controller._build_buffered_target_plan(seed)
+        self.assertIsNotNone(fused)
+        assert fused is not None
+        self.assertAlmostEqual(fused.target_point_base_m[0], 0.0100, places=3)
+        self.assertAlmostEqual(fused.target_point_base_m[1], 0.0080, places=3)
+
+        reference = controller._build_target_plan(seed)
+        self.assertIsNotNone(reference)
+        far_seed = make_snapshot(x_mm=80.0, y_mm=70.0, z_mm=760.0, yaw_deg=0.0)
+        rejected = controller._build_buffered_target_plan(far_seed, reference_plan=reference)
+        self.assertIsNone(rejected)
+
+    def test_target_plan_prepick_is_exactly_5cm_above_pick(self) -> None:
+        robot = FakeRobot()
+        vision = FakeVisionClient([])
+        controller = self._make_controller(robot, vision)
+        snapshot = make_snapshot(x_mm=15.0, y_mm=10.0, z_mm=760.0, yaw_deg=0.0)
+
+        plan = controller._build_target_plan(snapshot)
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertAlmostEqual(plan.prepick_tcp_pose[2] - plan.pick_tcp_pose[2], 0.05, places=6)
+
+    def test_success_path_uses_prepick_then_pick_then_lift_to_prepick(self) -> None:
+        robot = FakeRobot(verified_width=0.02)
+        centered = make_snapshot(x_mm=1.0, y_mm=1.0)
+        vision = FakeVisionClient([*([centered] * 12)])
+        controller = self._make_controller(robot, vision)
+
+        success = controller.execute_cycle(make_snapshot(x_mm=20.0, y_mm=15.0))
+        self.assertTrue(success)
+        linear_moves = [action for action in robot.actions if action[0] == "move_tcp_l"]
+        self.assertGreaterEqual(len(linear_moves), 2)
+
+        pick_move = linear_moves[0][1]
+        lift_move = linear_moves[-1][1]
+        self.assertAlmostEqual(float(lift_move[2]) - float(pick_move[2]), 0.05, places=3)
+        self.assertEqual(pick_move[0], lift_move[0])
+        self.assertEqual(pick_move[1], lift_move[1])
+        self.assertEqual(pick_move[3:], lift_move[3:])
 
     def test_keyboard_interrupt_runs_estop_and_recover(self) -> None:
         class InterruptVisionClient:

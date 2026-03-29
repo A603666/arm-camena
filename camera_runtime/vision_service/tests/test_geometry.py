@@ -8,6 +8,7 @@ from vision_service.app.geometry import (
     find_grasp_point,
     fit_ground_mask,
     fit_ground_plane,
+    fit_ground_plane_conservative_fast,
 )
 
 
@@ -102,6 +103,49 @@ def test_ground_fit_accepts_custom_max_trials() -> None:
     mask = fit_ground_mask(points, residual_mm=6.0, max_trials=12)
     assert mask.dtype == np.bool_
     assert mask.shape[0] == points.shape[0]
+
+
+def test_ground_fit_fast_mode_returns_plane_on_clean_scene() -> None:
+    rng = np.random.default_rng(1234)
+    x = rng.uniform(-250, 250, size=2800)
+    y = rng.uniform(-220, 220, size=2800)
+    z = 980 + 0.02 * x + 0.015 * y + rng.normal(0, 1.8, size=2800)
+    points = np.stack([x, y, z], axis=1).astype(np.float32)
+
+    plane, mode = fit_ground_plane_conservative_fast(
+        points=points,
+        residual_mm=8.0,
+        max_trials=120,
+        fast_enabled=True,
+        fast_sample_cap=1200,
+        fast_max_trials=30,
+        fast_min_inlier_ratio=0.4,
+        fast_min_inliers=120,
+    )
+    assert plane is not None
+    assert mode in {"fast", "fallback_full"}
+    assert int(np.count_nonzero(plane.inlier_mask)) > 500
+
+
+def test_ground_fit_fast_mode_falls_back_when_threshold_too_strict() -> None:
+    rng = np.random.default_rng(4321)
+    x = rng.uniform(-200, 200, size=2400)
+    y = rng.uniform(-200, 200, size=2400)
+    z = 1000 + 0.03 * x + 0.01 * y + rng.normal(0, 2.2, size=2400)
+    points = np.stack([x, y, z], axis=1).astype(np.float32)
+
+    plane, mode = fit_ground_plane_conservative_fast(
+        points=points,
+        residual_mm=8.0,
+        max_trials=120,
+        fast_enabled=True,
+        fast_sample_cap=900,
+        fast_max_trials=20,
+        fast_min_inlier_ratio=0.98,  # force fallback path on purpose
+        fast_min_inliers=5000,
+    )
+    assert plane is not None
+    assert mode == "fallback_full"
 
 
 def test_support_region_closing_merges_split_object_halves() -> None:

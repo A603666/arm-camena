@@ -17,8 +17,8 @@ def test_resolve_geom_backend_matrix() -> None:
     assert gb.resolve_geom_backend("torch", torch_cuda_available=False, cuml_available=False) == "cpu"
     assert gb.resolve_geom_backend("cuml", torch_cuda_available=True, cuml_available=False) == "torch"
     assert gb.resolve_geom_backend("auto", torch_cuda_available=False, cuml_available=False) == "cpu"
-    assert gb.resolve_geom_backend("auto", torch_cuda_available=True, cuml_available=False) == "torch"
-    assert gb.resolve_geom_backend("auto", torch_cuda_available=True, cuml_available=True) == "cuml"
+    assert gb.resolve_geom_backend("auto", torch_cuda_available=True, cuml_available=False) == "cpu"
+    assert gb.resolve_geom_backend("auto", torch_cuda_available=True, cuml_available=True) == "cpu"
 
 
 def test_build_geometry_backend_prefers_requested_cpu() -> None:
@@ -28,7 +28,7 @@ def test_build_geometry_backend_prefers_requested_cpu() -> None:
     assert selection.resolved == "cpu"
 
 
-def test_build_geometry_backend_uses_torch_when_available(monkeypatch) -> None:
+def test_build_geometry_backend_uses_torch_when_requested(monkeypatch) -> None:
     class FakeTorchBackend(gb.CPUReferenceBackend):
         name = "torch"
         is_gpu = True
@@ -39,9 +39,17 @@ def test_build_geometry_backend_uses_torch_when_available(monkeypatch) -> None:
     monkeypatch.setattr(gb, "detect_torch_cuda_available", lambda: True)
     monkeypatch.setattr(gb, "detect_cuml_available", lambda: False)
     monkeypatch.setattr(gb, "TorchCudaBackend", FakeTorchBackend)
-    backend, selection = gb.build_geometry_backend(requested_backend="auto", yolo_device="cuda:0")
+    backend, selection = gb.build_geometry_backend(requested_backend="torch", yolo_device="cuda:0")
     assert backend.name == "torch"
     assert selection.resolved == "torch"
+
+
+def test_build_geometry_backend_auto_prefers_cpu_even_if_gpu_available(monkeypatch) -> None:
+    monkeypatch.setattr(gb, "detect_torch_cuda_available", lambda: True)
+    monkeypatch.setattr(gb, "detect_cuml_available", lambda: True)
+    backend, selection = gb.build_geometry_backend(requested_backend="auto", yolo_device="cuda:0")
+    assert backend.name == "cpu"
+    assert selection.resolved == "cpu"
 
 
 def test_build_geometry_backend_falls_back_when_torch_ctor_fails(monkeypatch) -> None:

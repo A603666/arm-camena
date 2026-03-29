@@ -23,6 +23,9 @@ from dynamic_grasp.vision_client import VisionClient
 
 
 def default_config_path() -> Path:
+    unified = THIS_DIR / "pipeline_config.yaml"
+    if unified.is_file():
+        return unified
     return THIS_DIR / "dynamic_grasp_config.yaml"
 
 

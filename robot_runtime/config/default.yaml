@@ -1,7 +1,7 @@
 backend: real
 
 # Real arm CAN connection (official pyAgxArm SDK)
-can_channel: can1
+can_channel: can0
 can_interface: socketcan
 can_bitrate: 1000000
 pyagxarm_repo: ../../vendor/pyAgxArm
@@ -66,8 +66,8 @@ joint_test:
   dwell_sec: 0.3
   joints: [j1, j2, j3, j4, j5, j6]
 
-# User-requested 4-point process:
-# ready -> open -> pick -> close -> ready -> transport -> dump -> open -> transport -> ready
+# User-requested 5-step route (prepick derived from pick +50mm Z):
+# ready -> open -> prepick -> pick -> close -> ready -> transport -> dump -> open -> transport -> ready
 threepoint:
   # Keep orientation flexible to reduce IK singularity/no-solution risk.
   strict_down_enabled: false

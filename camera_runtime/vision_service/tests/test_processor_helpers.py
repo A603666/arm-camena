@@ -117,6 +117,116 @@ def test_stabilize_axis_holds_then_marks_unreliable() -> None:
     assert unreliable_quality == 0.1
 
 
+def test_stabilize_grasp_smooths_stable_measurements() -> None:
+    processor = object.__new__(VisionProcessor)
+    processor._cfg = SimpleNamespace(
+        geometry_force_recalc_iou=0.75,
+        grasp_hold_frames=7,
+        grasp_point_smooth_alpha=0.2,
+        grasp_yaw_smooth_alpha=0.2,
+        grasp_jump_xy_mm=22.0,
+        grasp_jump_z_mm=22.0,
+        grasp_jump_yaw_deg=20.0,
+    )
+    processor._grasp_tracker = None
+
+    xyz1, yaw1, state1, score1 = processor._stabilize_grasp(
+        raw_grasp_xyz_mm=np.array([10.0, 5.0, 1000.0], dtype=np.float32),
+        raw_yaw_deg=10.0,
+        class_id=1,
+        bbox=[100, 100, 220, 220],
+        axis_quality=0.9,
+    )
+    assert state1 == "live"
+    assert xyz1 is not None
+    assert yaw1 is not None
+    assert score1 > 0.8
+
+    xyz2, yaw2, state2, score2 = processor._stabilize_grasp(
+        raw_grasp_xyz_mm=np.array([12.0, 6.0, 1002.0], dtype=np.float32),
+        raw_yaw_deg=14.0,
+        class_id=1,
+        bbox=[102, 102, 222, 222],
+        axis_quality=0.9,
+    )
+    assert state2 == "live"
+    assert xyz2 is not None
+    assert yaw2 is not None
+    assert score2 > 0.7
+    assert float(xyz2[0]) < 12.0
+    assert 10.0 < float(yaw2) < 14.0
+
+
+def test_stabilize_grasp_holds_on_large_jump() -> None:
+    processor = object.__new__(VisionProcessor)
+    processor._cfg = SimpleNamespace(
+        geometry_force_recalc_iou=0.75,
+        grasp_hold_frames=2,
+        grasp_point_smooth_alpha=0.2,
+        grasp_yaw_smooth_alpha=0.2,
+        grasp_jump_xy_mm=20.0,
+        grasp_jump_z_mm=20.0,
+        grasp_jump_yaw_deg=20.0,
+    )
+    processor._grasp_tracker = None
+
+    xyz_live, yaw_live, _, _ = processor._stabilize_grasp(
+        raw_grasp_xyz_mm=np.array([0.0, 0.0, 900.0], dtype=np.float32),
+        raw_yaw_deg=5.0,
+        class_id=2,
+        bbox=[80, 80, 180, 180],
+        axis_quality=0.8,
+    )
+    assert xyz_live is not None
+    assert yaw_live is not None
+
+    xyz_held, yaw_held, state_held, _ = processor._stabilize_grasp(
+        raw_grasp_xyz_mm=np.array([80.0, 60.0, 950.0], dtype=np.float32),
+        raw_yaw_deg=60.0,
+        class_id=2,
+        bbox=[82, 82, 182, 182],
+        axis_quality=0.2,
+    )
+    assert state_held == "held"
+    assert xyz_held is not None
+    assert yaw_held is not None
+    assert np.allclose(xyz_held, xyz_live, atol=1e-6)
+    assert abs(float(yaw_held) - float(yaw_live)) < 1e-6
+
+
+def test_stabilize_grasp_wraps_yaw_near_180_deg() -> None:
+    processor = object.__new__(VisionProcessor)
+    processor._cfg = SimpleNamespace(
+        geometry_force_recalc_iou=0.75,
+        grasp_hold_frames=4,
+        grasp_point_smooth_alpha=0.2,
+        grasp_yaw_smooth_alpha=0.2,
+        grasp_jump_xy_mm=22.0,
+        grasp_jump_z_mm=22.0,
+        grasp_jump_yaw_deg=25.0,
+    )
+    processor._grasp_tracker = None
+
+    _, yaw1, _, _ = processor._stabilize_grasp(
+        raw_grasp_xyz_mm=np.array([1.0, 1.0, 900.0], dtype=np.float32),
+        raw_yaw_deg=179.0,
+        class_id=3,
+        bbox=[60, 60, 150, 150],
+        axis_quality=0.8,
+    )
+    _, yaw2, state2, _ = processor._stabilize_grasp(
+        raw_grasp_xyz_mm=np.array([1.5, 1.2, 900.5], dtype=np.float32),
+        raw_yaw_deg=-179.0,
+        class_id=3,
+        bbox=[61, 61, 151, 151],
+        axis_quality=0.8,
+    )
+    assert state2 == "live"
+    assert yaw1 is not None
+    assert yaw2 is not None
+    assert VisionProcessor._yaw_delta_deg(yaw1, yaw2) < 5.0
+
+
 def test_geometry_payload_within_threshold_accepts_small_delta() -> None:
     lhs = {
         "status": "ok",
@@ -162,6 +272,8 @@ def test_run_geometry_with_fallback_uses_cpu_on_backend_error() -> None:
     processor._geometry_parity_mismatch_count = 0
     processor._frame_index = 1
     processor._axis_tracker = None
+    processor._grasp_tracker = None
+    processor._support_source_tracker = None
     processor._logger = logging.getLogger("test")
 
     def fake_compute(*, backend, **kwargs):
@@ -202,6 +314,8 @@ def test_run_geometry_with_fallback_forces_cpu_after_parity_mismatch() -> None:
     processor._geometry_parity_mismatch_count = 0
     processor._frame_index = 10
     processor._axis_tracker = None
+    processor._grasp_tracker = None
+    processor._support_source_tracker = None
     processor._logger = logging.getLogger("test")
 
     def fake_compute(*, backend, **kwargs):
@@ -242,3 +356,95 @@ def test_run_geometry_with_fallback_forces_cpu_after_parity_mismatch() -> None:
     assert processor._geometry_force_cpu is True
     assert processor._geometry_parity_mismatch_count == 1
     assert processor._geometry_fallback_count == 1
+
+
+def test_select_target_uses_tracker_and_rejects_large_switch() -> None:
+    processor = object.__new__(VisionProcessor)
+    processor._cfg = SimpleNamespace(
+        center_depth_window=5,
+        min_depth_mm=80.0,
+        max_depth_mm=5000.0,
+        target_lock_iou_min=0.45,
+        target_lock_hits=2,
+        target_lost_hold_frames=4,
+        target_max_center_jump_px=80.0,
+        target_max_depth_jump_mm=80.0,
+    )
+    processor._target_tracker = None
+
+    depth = np.full((480, 640), 300, dtype=np.uint16)
+    depth[:220, :] = 200
+    top = {"conf": 0.42, "class_id": 31, "class_name": "snowboard", "bbox_xyxy": [267, 1, 415, 200]}
+    bottom = {"conf": 0.48, "class_id": 4, "class_name": "airplane", "bbox_xyxy": [139, 313, 538, 478]}
+
+    selected1, state1, _, reason1 = processor._select_target([top], 640, 480, depth, 1.0)
+    assert selected1 is None
+    assert state1 == "acquire"
+    assert reason1 == "acquiring_lock"
+
+    selected2, state2, score2, reason2 = processor._select_target([top], 640, 480, depth, 1.0)
+    assert selected2 is not None
+    assert state2 == "locked"
+    assert score2 is not None and score2 > 0.0
+    assert reason2 is None
+
+    selected3, state3, _, reason3 = processor._select_target([bottom], 640, 480, depth, 1.0)
+    assert selected3 is None
+    assert state3 == "lost"
+    assert reason3 in {"iou_break", "center_jump", "depth_jump"}
+
+
+def test_stabilize_support_source_has_hysteresis() -> None:
+    processor = object.__new__(VisionProcessor)
+    processor._cfg = SimpleNamespace(support_switch_hold_frames=3)
+    processor._support_source_tracker = None
+
+    options = {"support_region": {"points": np.zeros((1, 3))}, "legacy_cluster": {"points": np.zeros((1, 3))}}
+    source1, switches1 = processor._stabilize_support_source("support_region", options)
+    assert source1 == "support_region"
+    assert switches1 == 0
+
+    source2, _ = processor._stabilize_support_source("legacy_cluster", options)
+    source3, _ = processor._stabilize_support_source("legacy_cluster", options)
+    source4, switches4 = processor._stabilize_support_source("legacy_cluster", options)
+    assert source2 == "support_region"
+    assert source3 == "support_region"
+    assert source4 == "legacy_cluster"
+    assert switches4 == 1
+
+
+def test_evaluate_geometry_quality_rejects_low_quality_frames() -> None:
+    processor = object.__new__(VisionProcessor)
+    processor._cfg = SimpleNamespace(
+        depth_valid_ratio_min=0.03,
+        support_points_min=180,
+        support_fill_ratio_min=0.02,
+        ground_ratio_max=0.96,
+        axis_eig_ratio_min=1.35,
+        quality_score_min=0.5,
+    )
+    low_seg = {
+        "depth_valid_ratio": 0.005,
+        "support_points": 120,
+        "support_fill_ratio": 0.01,
+        "ground_ratio": 0.99,
+        "axis_eig_ratio": 1.1,
+    }
+    ok, score, flags = processor._evaluate_geometry_quality(low_seg)
+    assert ok is False
+    assert score < 0.5
+    assert "quality_score" in flags
+    assert "depth_valid_ratio" in flags
+    assert "support_points" in flags
+
+    good_seg = {
+        "depth_valid_ratio": 0.06,
+        "support_points": 450,
+        "support_fill_ratio": 0.14,
+        "ground_ratio": 0.7,
+        "axis_eig_ratio": 2.2,
+    }
+    ok_good, score_good, flags_good = processor._evaluate_geometry_quality(good_seg)
+    assert ok_good is True
+    assert score_good >= 0.5
+    assert flags_good == []

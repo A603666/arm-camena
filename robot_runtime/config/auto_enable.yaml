@@ -3,7 +3,7 @@
 #   cd ../../vendor/pyAgxArm/pyAgxArm/scripts/ubuntu
 #   bash find_all_can_port.sh
 
-can_channel: can1
+can_channel: can0
 can_bitrate: 1000000
 can_interface: socketcan
 
@@ -18,7 +18,7 @@ can_scripts_dir: ../../vendor/pyAgxArm/pyAgxArm/scripts/ubuntu
 retry_interval_sec: 2.0
 
 # Maximum time to wait for full joint enable.
-enable_timeout_sec: 8.0
+enable_timeout_sec: 12.0
 
 # Health-check period after session is established.
 health_check_sec: 1.0

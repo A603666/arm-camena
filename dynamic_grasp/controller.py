@@ -21,8 +21,8 @@ class TargetPlan:
     snapshot: VisionSnapshot
     target_point_base_m: tuple[float, float, float]
     target_yaw_rad: float
-    hover_tcp_pose: tuple[float, float, float, float, float, float]
-    final_tcp_pose: tuple[float, float, float, float, float, float]
+    prepick_tcp_pose: tuple[float, float, float, float, float, float]
+    pick_tcp_pose: tuple[float, float, float, float, float, float]
 
 
 class DynamicGraspController:
@@ -71,6 +71,79 @@ class DynamicGraspController:
     @staticmethod
     def _normalize_angle(angle_rad: float) -> float:
         return math.atan2(math.sin(float(angle_rad)), math.cos(float(angle_rad)))
+
+    @staticmethod
+    def _yaw_delta_deg(lhs_deg: float, rhs_deg: float) -> float:
+        raw = abs(float(lhs_deg) - float(rhs_deg)) % 360.0
+        return min(raw, 360.0 - raw)
+
+    @staticmethod
+    def _bbox_iou(lhs: tuple[int, int, int, int] | None, rhs: tuple[int, int, int, int] | None) -> float:
+        if lhs is None or rhs is None:
+            return 0.0
+        x_left = max(int(lhs[0]), int(rhs[0]))
+        y_top = max(int(lhs[1]), int(rhs[1]))
+        x_right = min(int(lhs[2]), int(rhs[2]))
+        y_bottom = min(int(lhs[3]), int(rhs[3]))
+        inter_w = max(0, x_right - x_left)
+        inter_h = max(0, y_bottom - y_top)
+        inter_area = float(inter_w * inter_h)
+        if inter_area <= 0.0:
+            return 0.0
+        lhs_area = float(max(0, int(lhs[2]) - int(lhs[0])) * max(0, int(lhs[3]) - int(lhs[1])))
+        rhs_area = float(max(0, int(rhs[2]) - int(rhs[0])) * max(0, int(rhs[3]) - int(rhs[1])))
+        union_area = lhs_area + rhs_area - inter_area
+        if union_area <= 0.0:
+            return 0.0
+        return inter_area / union_area
+
+    @staticmethod
+    def _snapshot_yaw_deg(snapshot: VisionSnapshot) -> float | None:
+        if not isinstance(snapshot.raw, dict):
+            return None
+        grasp = snapshot.raw.get("grasp")
+        if not isinstance(grasp, dict) or grasp.get("yaw_deg") is None:
+            return None
+        try:
+            return float(grasp.get("yaw_deg"))
+        except (TypeError, ValueError):
+            return None
+
+    def _snapshot_within_tolerance(self, prev: VisionSnapshot, cur: VisionSnapshot) -> bool:
+        if not prev.is_trackable or not cur.is_trackable:
+            return False
+        if self._bbox_iou(prev.bbox_xyxy, cur.bbox_xyxy) < 0.45:
+            return False
+        prev_point = prev.grasp_point_optical_m
+        cur_point = cur.grasp_point_optical_m
+        if prev_point is None or cur_point is None:
+            return False
+        dx_mm = (float(cur_point[0]) - float(prev_point[0])) * 1000.0
+        dy_mm = (float(cur_point[1]) - float(prev_point[1])) * 1000.0
+        dz_mm = (float(cur_point[2]) - float(prev_point[2])) * 1000.0
+        pos_mm = math.hypot(dx_mm, dy_mm)
+        if pos_mm > float(self.config.vision.stable_pos_tol_mm):
+            return False
+        if abs(dz_mm) > float(self.config.vision.stable_z_tol_mm):
+            return False
+
+        prev_yaw = self._snapshot_yaw_deg(prev)
+        cur_yaw = self._snapshot_yaw_deg(cur)
+        if prev_yaw is not None and cur_yaw is not None:
+            if self._yaw_delta_deg(prev_yaw, cur_yaw) > float(self.config.vision.stable_yaw_tol_deg):
+                return False
+        return True
+
+    def _snapshot_quality_ok(self, snapshot: VisionSnapshot) -> bool:
+        if not self.config.vision.reject_on_quality_drop:
+            return True
+        score = snapshot.source_quality_score
+        if score is None:
+            # Keep backward compatibility with older vision payloads.
+            return True
+        if snapshot.quality_flags:
+            return False
+        return float(score) >= float(self.config.vision.min_quality_score)
 
     def _prefer_equivalent_grasp_yaw(self, yaw_rad: float, reference_yaw_rad: float | None) -> float:
         """Pick yaw or yaw+pi, whichever is closer to the reference orientation.
@@ -131,7 +204,7 @@ class DynamicGraspController:
     def _wait_for_trackable_target(self, timeout_sec: float | None, stable_required: int | None = None) -> VisionSnapshot | None:
         deadline = None if timeout_sec is None else (time.time() + float(timeout_sec))
         stable_hits = 0
-        last_signature: tuple[Any, ...] | None = None
+        last_snapshot: VisionSnapshot | None = None
         needed = max(1, stable_required or self.config.vision.target_stable_frames)
 
         while True:
@@ -141,21 +214,27 @@ class DynamicGraspController:
             except VisionClientError as exc:
                 self.logger.warning("vision poll failed: %s", exc)
                 stable_hits = 0
-                last_signature = None
+                last_snapshot = None
                 snapshot = None
                 health_stream = False
             else:
                 health_stream = health.stream_connected
 
             if snapshot is not None and health_stream and snapshot.is_trackable:
-                signature = snapshot.signature()
-                stable_hits = stable_hits + 1 if signature == last_signature else 1
-                last_signature = signature
+                if not self._snapshot_quality_ok(snapshot):
+                    stable_hits = 0
+                    last_snapshot = None
+                    if deadline is not None and time.time() >= deadline:
+                        return None
+                    time.sleep(self._poll_sleep_sec)
+                    continue
+                stable_hits = stable_hits + 1 if (last_snapshot is not None and self._snapshot_within_tolerance(last_snapshot, snapshot)) else 1
+                last_snapshot = snapshot
                 if stable_hits >= needed:
                     return snapshot
             else:
                 stable_hits = 0
-                last_signature = None
+                last_snapshot = None
 
             if deadline is not None and time.time() >= deadline:
                 return None
@@ -251,6 +330,8 @@ class DynamicGraspController:
         current_tcp = self.robot.get_tcp_pose()
         if current_flange is None or snapshot.grasp_point_optical_m is None or snapshot.axis_dir_optical is None:
             return None
+        if not self._snapshot_quality_ok(snapshot):
+            return None
         if current_tcp is None:
             return None
         if self.ready_tcp_pose is None:
@@ -264,13 +345,24 @@ class DynamicGraspController:
         )
         reference_yaw = current_tcp[5]
         target_yaw = self._prefer_equivalent_grasp_yaw(target_yaw, reference_yaw)
+        return self._build_target_plan_from_values(snapshot, target_point_base, target_yaw, current_tcp)
 
-        final_z = float(target_point_base[2]) + self.config.grasp.final_z_offset_m
-        if final_z < self.config.grasp.min_safe_z_m:
-            self.logger.warning("reject target: final z %.4f below min_safe_z %.4f", final_z, self.config.grasp.min_safe_z_m)
+    def _build_target_plan_from_values(
+        self,
+        snapshot: VisionSnapshot,
+        target_point_base: np.ndarray,
+        target_yaw: float,
+        current_tcp: list[float],
+    ) -> TargetPlan | None:
+        if self.ready_tcp_pose is None:
             return None
 
-        descent = float(self.ready_tcp_pose[2]) - final_z
+        pick_z = float(target_point_base[2]) + self.config.grasp.final_z_offset_m
+        if pick_z < self.config.grasp.min_safe_z_m:
+            self.logger.warning("reject target: pick z %.4f below min_safe_z %.4f", pick_z, self.config.grasp.min_safe_z_m)
+            return None
+
+        descent = float(self.ready_tcp_pose[2]) - pick_z
         if descent > self.config.grasp.max_descent_m:
             self.logger.warning(
                 "reject target: descent %.4f exceeds max_descent %.4f",
@@ -279,22 +371,19 @@ class DynamicGraspController:
             )
             return None
 
-        hover_z = max(
-            float(target_point_base[2]) + self.config.grasp.hover_clearance_m,
-            final_z + max(0.005, self.config.grasp.hover_clearance_m * 0.25),
-        )
-        hover_tcp_pose = (
+        prepick_z = pick_z + self.config.grasp.prepick_offset_m
+        prepick_tcp_pose = (
             float(target_point_base[0]),
             float(target_point_base[1]),
-            hover_z,
+            prepick_z,
             float(current_tcp[3]),
             float(current_tcp[4]),
             target_yaw,
         )
-        final_tcp_pose = (
+        pick_tcp_pose = (
             float(target_point_base[0]),
             float(target_point_base[1]),
-            final_z,
+            pick_z,
             float(current_tcp[3]),
             float(current_tcp[4]),
             target_yaw,
@@ -307,9 +396,74 @@ class DynamicGraspController:
                 float(target_point_base[2]),
             ),
             target_yaw_rad=target_yaw,
-            hover_tcp_pose=hover_tcp_pose,
-            final_tcp_pose=final_tcp_pose,
+            prepick_tcp_pose=prepick_tcp_pose,
+            pick_tcp_pose=pick_tcp_pose,
         )
+
+    @staticmethod
+    def _plan_jump_mm(lhs: TargetPlan, rhs: TargetPlan) -> float:
+        dx = (float(rhs.target_point_base_m[0]) - float(lhs.target_point_base_m[0])) * 1000.0
+        dy = (float(rhs.target_point_base_m[1]) - float(lhs.target_point_base_m[1])) * 1000.0
+        dz = (float(rhs.target_point_base_m[2]) - float(lhs.target_point_base_m[2])) * 1000.0
+        return float(math.sqrt((dx * dx) + (dy * dy) + (dz * dz)))
+
+    def _fuse_target_plans(self, plans: list[TargetPlan]) -> TargetPlan | None:
+        if not plans:
+            return None
+        points = np.asarray([list(plan.target_point_base_m) for plan in plans], dtype=np.float64)
+        fused_point = np.median(points, axis=0)
+        yaws = np.asarray([float(plan.target_yaw_rad) for plan in plans], dtype=np.float64)
+        mean_yaw = math.atan2(float(np.mean(np.sin(yaws))), float(np.mean(np.cos(yaws))))
+        reference_yaw = float(plans[-1].target_yaw_rad)
+        fused_yaw = self._prefer_equivalent_grasp_yaw(mean_yaw, reference_yaw)
+        current_tcp = self.robot.get_tcp_pose()
+        if current_tcp is None:
+            current_tcp = list(plans[-1].pick_tcp_pose)
+        return self._build_target_plan_from_values(plans[-1].snapshot, fused_point, fused_yaw, current_tcp)
+
+    def _build_buffered_target_plan(
+        self,
+        seed_snapshot: VisionSnapshot,
+        reference_plan: TargetPlan | None = None,
+    ) -> TargetPlan | None:
+        plan = self._build_target_plan(seed_snapshot)
+        if plan is None:
+            return None
+        max_jump_mm = float(self.config.vision.max_replan_jump_mm)
+        if reference_plan is not None and self._plan_jump_mm(reference_plan, plan) > max_jump_mm:
+            return None
+
+        required = max(1, int(self.config.vision.plan_buffer_frames))
+        plans = [plan]
+        attempts = 0
+        max_attempts = max(required * 6, 6)
+        while len(plans) < required and attempts < max_attempts:
+            attempts += 1
+            snapshot = self._wait_for_trackable_target(
+                timeout_sec=self.config.scan.lost_target_timeout_sec,
+                stable_required=1,
+            )
+            if snapshot is None:
+                break
+            candidate = self._build_target_plan(snapshot)
+            if candidate is None:
+                continue
+            anchor = plans[-1]
+            jump_mm = self._plan_jump_mm(anchor, candidate)
+            if jump_mm > max_jump_mm:
+                self.logger.warning("plan buffer jump %.1fmm > %.1fmm, restarting buffer", jump_mm, max_jump_mm)
+                if reference_plan is not None and self._plan_jump_mm(reference_plan, candidate) > max_jump_mm:
+                    continue
+                plans = [candidate]
+                continue
+            plans.append(candidate)
+
+        fused = self._fuse_target_plans(plans)
+        if fused is None:
+            return None
+        if reference_plan is not None and self._plan_jump_mm(reference_plan, fused) > max_jump_mm:
+            return None
+        return fused
 
     def _grasp_verified(self, status: Any, ctrl: Any) -> bool:
         if status is None or ctrl is None:
@@ -398,37 +552,48 @@ class DynamicGraspController:
             self._recover_to_ready("yaw align failed")
             return False
 
-        self._prompt("Start descend phase")
-        plan = self._build_target_plan(aligned_snapshot)
+        self._prompt("Start prepick phase")
+        plan = self._build_buffered_target_plan(aligned_snapshot)
         if plan is None:
-            self._recover_to_ready("invalid descend plan")
+            self._recover_to_ready("invalid prepick/pick plan")
             return False
 
-        if not self.robot.move_tcp_p(plan.hover_tcp_pose):
-            self._recover_to_ready("hover move failed")
+        if not self.robot.move_tcp_p(plan.prepick_tcp_pose):
+            self._recover_to_ready("prepick move failed")
             return False
-        if not self._joint7_is_safe("hover move"):
-            self._recover_to_ready("hover move failed J7 check")
-            return False
-
-        refreshed_snapshot = self._wait_for_trackable_target(
-            timeout_sec=self.config.scan.lost_target_timeout_sec,
-            stable_required=1,
-        )
-        if refreshed_snapshot is None:
-            self._recover_to_ready("target lost before final descend")
+        if not self._joint7_is_safe("prepick move"):
+            self._recover_to_ready("prepick move failed J7 check")
             return False
 
-        plan = self._build_target_plan(refreshed_snapshot)
-        if plan is None:
-            self._recover_to_ready("refreshed descend plan invalid")
+        refreshed_ok = False
+        replan_attempts = max(2, int(self.config.vision.plan_buffer_frames) + 1)
+        for attempt in range(replan_attempts):
+            refreshed_snapshot = self._wait_for_trackable_target(
+                timeout_sec=self.config.scan.lost_target_timeout_sec,
+                stable_required=1,
+            )
+            if refreshed_snapshot is None:
+                break
+            refreshed_plan = self._build_buffered_target_plan(refreshed_snapshot, reference_plan=plan)
+            if refreshed_plan is None:
+                self.logger.warning(
+                    "replan jump beyond threshold (attempt %d/%d), resampling",
+                    attempt + 1,
+                    replan_attempts,
+                )
+                continue
+            plan = refreshed_plan
+            refreshed_ok = True
+            break
+        if not refreshed_ok:
+            self._recover_to_ready("target unstable before pick descend")
             return False
 
-        if not self.robot.move_tcp_l(plan.final_tcp_pose):
-            self._recover_to_ready("final descend failed")
+        if not self.robot.move_tcp_l(plan.pick_tcp_pose):
+            self._recover_to_ready("pick descend failed")
             return False
-        if not self._joint7_is_safe("final descend"):
-            self._recover_to_ready("final descend failed J7 check")
+        if not self._joint7_is_safe("pick descend"):
+            self._recover_to_ready("pick descend failed J7 check")
             return False
 
         self._prompt("Close gripper")
@@ -442,11 +607,11 @@ class DynamicGraspController:
             self._recover_to_ready("grasp verification failed")
             return False
 
-        if not self.robot.move_tcp_l(plan.hover_tcp_pose):
-            self._recover_to_ready("lift after grasp failed")
+        if not self.robot.move_tcp_l(plan.prepick_tcp_pose):
+            self._recover_to_ready("lift to prepick failed")
             return False
-        if not self._joint7_is_safe("lift after grasp"):
-            self._recover_to_ready("lift after grasp failed J7 check")
+        if not self._joint7_is_safe("lift to prepick"):
+            self._recover_to_ready("lift to prepick failed J7 check")
             return False
 
         if not self._move_ready("post-grasp ready"):

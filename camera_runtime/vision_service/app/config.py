@@ -29,6 +29,11 @@ class AppConfig:
     max_depth_mm: float
     ransac_residual_mm: float
     ransac_max_trials: int
+    ground_fit_fast_enabled: bool
+    ground_fit_fast_sample_cap: int
+    ground_fit_fast_max_trials: int
+    ground_fit_fast_min_inlier_ratio: float
+    ground_fit_fast_min_inliers: int
     dbscan_eps_mm: float
     dbscan_min_samples: int
     min_object_points: int
@@ -42,6 +47,23 @@ class AppConfig:
     axis_eig_ratio_min: float
     axis_hold_frames: int
     axis_smooth_alpha: float
+    target_lock_iou_min: float
+    target_lock_hits: int
+    target_lost_hold_frames: int
+    target_max_center_jump_px: float
+    target_max_depth_jump_mm: float
+    support_switch_hold_frames: int
+    depth_valid_ratio_min: float
+    support_points_min: int
+    support_fill_ratio_min: float
+    ground_ratio_max: float
+    quality_score_min: float
+    grasp_point_smooth_alpha: float
+    grasp_yaw_smooth_alpha: float
+    grasp_hold_frames: int
+    grasp_jump_xy_mm: float
+    grasp_jump_z_mm: float
+    grasp_jump_yaw_deg: float
     annotated_jpeg_quality: int
     stale_frame_threshold_sec: float
     robot_control_enabled: bool
@@ -96,8 +118,13 @@ def load_config() -> AppConfig:
     service_root = Path(__file__).resolve().parents[1]
     workspace_root = service_root.parent
     repo_root = workspace_root.parent
+    unified_cfg = repo_root / "pipeline_config.yaml"
     default_model = workspace_root / "yolo26n.pt"
-    default_arm_config = repo_root / "robot_runtime" / "config" / "default.yaml"
+    default_arm_config = (
+        unified_cfg
+        if unified_cfg.is_file()
+        else repo_root / "robot_runtime" / "config" / "default.yaml"
+    )
     configured_model = Path(os.getenv("DABAI_YOLO_MODEL", str(default_model))).expanduser().resolve()
     configured_robot_cfg = Path(os.getenv("DABAI_ROBOT_CONFIG", str(default_arm_config))).expanduser().resolve()
     backend_override_raw = os.getenv("DABAI_ROBOT_BACKEND_OVERRIDE", "").strip().lower()
@@ -126,6 +153,11 @@ def load_config() -> AppConfig:
         max_depth_mm=max(500.0, _get_env_float("DABAI_MAX_DEPTH_MM", 5000.0)),
         ransac_residual_mm=max(1.0, _get_env_float("DABAI_RANSAC_RESIDUAL_MM", 12.0)),
         ransac_max_trials=max(8, min(200, _get_env_int("DABAI_RANSAC_MAX_TRIALS", 120))),
+        ground_fit_fast_enabled=_get_env_bool("DABAI_GROUND_FIT_FAST_ENABLED", True),
+        ground_fit_fast_sample_cap=max(500, min(20000, _get_env_int("DABAI_GROUND_FIT_FAST_SAMPLE_CAP", 2500))),
+        ground_fit_fast_max_trials=max(8, min(120, _get_env_int("DABAI_GROUND_FIT_FAST_MAX_TRIALS", 40))),
+        ground_fit_fast_min_inlier_ratio=max(0.05, min(1.0, _get_env_float("DABAI_GROUND_FIT_FAST_MIN_INLIER_RATIO", 0.55))),
+        ground_fit_fast_min_inliers=max(60, min(20000, _get_env_int("DABAI_GROUND_FIT_FAST_MIN_INLIERS", 80))),
         dbscan_eps_mm=max(1.0, _get_env_float("DABAI_DBSCAN_EPS_MM", 20.0)),
         dbscan_min_samples=max(3, _get_env_int("DABAI_DBSCAN_MIN_SAMPLES", 30)),
         min_object_points=max(30, _get_env_int("DABAI_MIN_OBJECT_POINTS", 120)),
@@ -139,6 +171,23 @@ def load_config() -> AppConfig:
         axis_eig_ratio_min=max(1.01, _get_env_float("DABAI_AXIS_EIG_RATIO_MIN", 1.35)),
         axis_hold_frames=max(0, min(60, _get_env_int("DABAI_AXIS_HOLD_FRAMES", 5))),
         axis_smooth_alpha=max(0.0, min(1.0, _get_env_float("DABAI_AXIS_SMOOTH_ALPHA", 0.25))),
+        target_lock_iou_min=max(0.10, min(0.95, _get_env_float("DABAI_TARGET_LOCK_IOU_MIN", 0.45))),
+        target_lock_hits=max(1, min(10, _get_env_int("DABAI_TARGET_LOCK_HITS", 2))),
+        target_lost_hold_frames=max(0, min(60, _get_env_int("DABAI_TARGET_LOST_HOLD_FRAMES", 6))),
+        target_max_center_jump_px=max(1.0, min(800.0, _get_env_float("DABAI_TARGET_MAX_CENTER_JUMP_PX", 80.0))),
+        target_max_depth_jump_mm=max(1.0, min(2000.0, _get_env_float("DABAI_TARGET_MAX_DEPTH_JUMP_MM", 80.0))),
+        support_switch_hold_frames=max(1, min(20, _get_env_int("DABAI_SUPPORT_SWITCH_HOLD_FRAMES", 3))),
+        depth_valid_ratio_min=max(0.001, min(1.0, _get_env_float("DABAI_DEPTH_VALID_RATIO_MIN", 0.03))),
+        support_points_min=max(30, min(50000, _get_env_int("DABAI_SUPPORT_POINTS_MIN", 180))),
+        support_fill_ratio_min=max(0.001, min(1.0, _get_env_float("DABAI_SUPPORT_FILL_RATIO_MIN", 0.02))),
+        ground_ratio_max=max(0.10, min(1.0, _get_env_float("DABAI_GROUND_RATIO_MAX", 0.96))),
+        quality_score_min=max(0.0, min(1.0, _get_env_float("DABAI_QUALITY_SCORE_MIN", 0.50))),
+        grasp_point_smooth_alpha=max(0.0, min(1.0, _get_env_float("DABAI_GRASP_POINT_SMOOTH_ALPHA", 0.20))),
+        grasp_yaw_smooth_alpha=max(0.0, min(1.0, _get_env_float("DABAI_GRASP_YAW_SMOOTH_ALPHA", 0.20))),
+        grasp_hold_frames=max(0, min(60, _get_env_int("DABAI_GRASP_HOLD_FRAMES", 7))),
+        grasp_jump_xy_mm=max(1.0, min(300.0, _get_env_float("DABAI_GRASP_JUMP_XY_MM", 22.0))),
+        grasp_jump_z_mm=max(1.0, min(300.0, _get_env_float("DABAI_GRASP_JUMP_Z_MM", 22.0))),
+        grasp_jump_yaw_deg=max(1.0, min(180.0, _get_env_float("DABAI_GRASP_JUMP_YAW_DEG", 20.0))),
         annotated_jpeg_quality=max(50, min(95, _get_env_int("DABAI_ANNOTATED_JPEG_QUALITY", 85))),
         stale_frame_threshold_sec=max(0.2, _get_env_float("DABAI_STALE_FRAME_SEC", 2.0)),
         robot_control_enabled=_get_env_bool("DABAI_ROBOT_CONTROL_ENABLED", True),

@@ -66,6 +66,16 @@
       background: #f7fbff;
       color: #334155;
     }
+    .nav-link {
+      font-size: 13px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid #9ac5c0;
+      background: #e8f7f5;
+      color: #0f4f49;
+      text-decoration: none;
+      font-weight: 600;
+    }
     .grid {
       display: grid;
       grid-template-columns: 1.25fr 1fr 1fr;
@@ -82,6 +92,11 @@
     .card h2 {
       margin: 0 0 10px;
       font-size: 17px;
+    }
+    .card h3 {
+      margin: 12px 0 8px;
+      font-size: 14px;
+      color: #0f3342;
     }
     .video {
       width: 100%;
@@ -110,7 +125,7 @@
     .danger { color: var(--danger); }
     pre {
       margin: 0;
-      max-height: 300px;
+      max-height: 340px;
       overflow: auto;
       background: #0c1116;
       color: #d9f3de;
@@ -146,10 +161,55 @@
       color: #9f1d1d;
       font-weight: 700;
     }
+    button.warn-btn {
+      border-color: #ffe6bb;
+      background: #fff8ec;
+      color: #9a5a00;
+      font-weight: 700;
+    }
     .robot-meta {
       margin-top: 8px;
       color: var(--soft);
       font-size: 12px;
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .field {
+      display: grid;
+      gap: 4px;
+      font-size: 12px;
+      color: var(--soft);
+    }
+    .field input,
+    .field select {
+      border: 1px solid #c8d6e2;
+      border-radius: 7px;
+      padding: 6px 8px;
+      font-size: 13px;
+      color: #0f3342;
+      background: #ffffff;
+      width: 100%;
+    }
+    .field input[type="range"] {
+      padding: 0;
+    }
+    .action-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .hint {
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--soft);
+    }
+    .full-width {
+      grid-column: 1 / -1;
     }
     @media (max-width: 1120px) {
       .grid { grid-template-columns: 1fr 1fr; }
@@ -157,6 +217,7 @@
     @media (max-width: 920px) {
       .grid { grid-template-columns: 1fr; }
       .btn-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .form-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -168,6 +229,7 @@
         <p class="sub">YOLO 推理 + 深度几何 + NERO 核心控制命令</p>
       </div>
       <div class="badges">
+        <a class="nav-link" href="/calibration">打开标定工作台</a>
         <div id="healthBadge" class="status">视觉连接中...</div>
         <div id="robotBadge" class="status">机械臂状态未知</div>
       </div>
@@ -202,6 +264,10 @@
           <div class="k">控制功能</div><div id="robotEnabled" class="v">-</div>
           <div class="k">连接状态</div><div id="robotConnected" class="v">-</div>
           <div class="k">执行状态</div><div id="robotBusy" class="v">-</div>
+          <div class="k">速度百分比</div><div id="robotSpeed" class="v">-</div>
+          <div class="k">重力补偿</div><div id="robotGravity" class="v">-</div>
+          <div class="k">控制模式</div><div id="robotCtrlMode" class="v">-</div>
+          <div class="k">测试抓取覆盖</div><div id="robotOverride" class="v">-</div>
           <div class="k">J7 实时角度</div><div id="robotJ7" class="v">-</div>
           <div class="k">逐步进度</div><div id="robotStep" class="v">-</div>
           <div class="k">最后命令</div><div id="robotLast" class="v">-</div>
@@ -211,6 +277,12 @@
           <button data-command="status">状态</button>
           <button data-command="precheck">预检</button>
           <button data-command="enable">使能</button>
+          <button
+            class="warn-btn"
+            data-command="enable_gravity_compensation"
+            data-confirm="开启重力补偿后机械臂可能出现下坠或被手动拖动，请确认机械臂处于安全姿态且周围无人后再继续。"
+          >开启重力补偿</button>
+          <button data-command="disable_gravity_compensation">恢复普通模式</button>
           <button data-command="home">回零</button>
           <button data-command="open">开夹爪</button>
           <button data-command="close">关夹爪</button>
@@ -219,9 +291,30 @@
           <button data-command="run_threepoint_step_start">逐步开始</button>
           <button data-command="run_threepoint_step_next">逐步下一步</button>
           <button data-command="run_threepoint_step_cancel">逐步取消</button>
+          <button
+            class="warn-btn"
+            data-command="reset_clear_errors"
+            data-confirm="重启清错会导致机械臂立刻失电，然后尝试重新使能。请确认机械臂处于安全状态。"
+          >重启清错</button>
+          <button class="warn-btn" data-command="disable">机械臂失能</button>
           <button class="danger-btn" data-command="estop">急停</button>
         </div>
-        <div class="robot-meta">命令执行时会自动锁定非急停按钮，避免并发下发运动指令。</div>
+
+        <h3>调速栏</h3>
+        <div class="form-grid">
+          <div class="field">
+            <label for="speedSlider">速度滑条 (1~100)</label>
+            <input id="speedSlider" type="range" min="1" max="100" step="1" value="30" />
+          </div>
+          <div class="field">
+            <label for="speedNumber">速度数值</label>
+            <input id="speedNumber" type="number" min="1" max="100" step="1" value="30" />
+          </div>
+        </div>
+        <div class="action-row">
+          <button id="applySpeedBtn">应用速度</button>
+        </div>
+        <div class="robot-meta">执行中会锁定普通指令按钮，仅保留急停/失能/重启清错；测试流程结束会自动恢复抓取位覆盖。</div>
       </div>
     </div>
 
@@ -230,10 +323,54 @@
         <h2>机械臂命令输出</h2>
         <pre id="robotOutput">{}</pre>
       </div>
+
       <div class="card">
-        <h2>视觉原始 JSON</h2>
-        <pre id="raw">{}</pre>
+        <h2>随机抓取点测试</h2>
+        <div class="form-grid">
+          <div class="field"><label for="randomX">抓取点 X(mm)</label><input id="randomX" type="number" step="0.01" /></div>
+          <div class="field"><label for="randomY">抓取点 Y(mm)</label><input id="randomY" type="number" step="0.01" /></div>
+          <div class="field"><label for="randomZ">抓取点 Z(mm)</label><input id="randomZ" type="number" step="0.01" /></div>
+          <div class="field"><label for="randomYaw">抓取 yaw(deg)</label><input id="randomYaw" type="number" step="0.01" /></div>
+          <div class="field"><label for="randomCloseWidth">关夹爪宽度(m)</label><input id="randomCloseWidth" type="number" step="0.001" min="0" value="0" /></div>
+          <div class="field"><label for="randomForce">关夹爪力度</label><input id="randomForce" type="number" step="0.1" min="0" value="1" /></div>
+          <div class="field"><label for="randomSegments">平滑分段(1~10)</label><input id="randomSegments" type="number" step="1" min="1" max="10" value="3" /></div>
+        </div>
+        <div class="action-row">
+          <button id="fillFromLiveBtn">填充当前识别抓取点</button>
+          <button id="applyRandomBtn">应用为测试抓取位</button>
+          <button id="clearRandomBtn">清除测试抓取位</button>
+        </div>
+        <div class="hint">仅覆盖会话内 `pick` 抓取位与关夹爪参数，`ready/transport/dump` 不变。</div>
       </div>
+
+      <div class="card">
+        <h2>动态抓取测试</h2>
+        <div class="kv">
+          <div class="k">模式状态</div><div id="dynamicModeState" class="v">未启动</div>
+          <div class="k">当前类别</div><div id="dynamicLiveClass" class="v">-</div>
+          <div class="k">当前置信度</div><div id="dynamicLiveConf" class="v">-</div>
+          <div class="k">当前抓取点</div><div id="dynamicLiveGrasp" class="v">-</div>
+          <div class="k">窗口进度</div><div id="dynamicWindow" class="v">0/18</div>
+          <div class="k">稳定判定</div><div id="dynamicStableState" class="v">未稳定</div>
+          <div class="k">稳定点位</div><div id="dynamicStablePoint" class="v">-</div>
+        </div>
+        <div class="form-grid">
+          <div class="field"><label for="dynamicCloseWidth">关夹爪宽度(m)</label><input id="dynamicCloseWidth" type="number" step="0.001" min="0" value="0" /></div>
+          <div class="field"><label for="dynamicForce">关夹爪力度</label><input id="dynamicForce" type="number" step="0.1" min="0" value="1" /></div>
+          <div class="field"><label for="dynamicSegments">平滑分段(1~10)</label><input id="dynamicSegments" type="number" step="1" min="1" max="10" value="3" /></div>
+        </div>
+        <div class="action-row">
+          <button id="dynamicStartBtn">启动动态模式</button>
+          <button id="dynamicStopBtn">停止动态模式</button>
+          <button id="dynamicSaveBtn">保存稳定点为抓取位</button>
+        </div>
+        <div class="hint">严格稳定规则：18帧窗口、类别一致、axis_state=live、axis_quality中位数>=0.85、XYZ和yaw MAD达标、机械臂空闲。</div>
+      </div>
+    </div>
+
+    <div class="card full-width">
+      <h2>视觉原始 JSON</h2>
+      <pre id="raw">{}</pre>
     </div>
   </div>
 
@@ -242,6 +379,25 @@
 
     const robotCommandButtons = Array.from(document.querySelectorAll("#robotButtons button[data-command]"));
     let robotStateCache = null;
+    let latestVisionData = null;
+
+    const dynamicState = {
+      active: false,
+      window: [],
+      stableSnapshot: null,
+      latestReason: "未启动",
+    };
+
+    const GRAVITY_INTERLOCKED_COMMANDS = new Set([
+      "home",
+      "run_threepoint_auto",
+      "run_threepoint_step_start",
+      "run_threepoint_step_next",
+    ]);
+
+    const DYNAMIC_WINDOW = 18;
+    const DYNAMIC_MIN_AXIS_QUALITY = 0.85;
+    const DYNAMIC_MAD_LIMIT = { x: 1.5, y: 1.5, z: 2.0, yaw: 1.2 };
 
     function fmt(n, digits = 2) {
       if (n === null || n === undefined || Number.isNaN(n)) return "-";
@@ -253,18 +409,91 @@
       return Number(rad) * 180 / Math.PI;
     }
 
+    function normalizeDeg(value) {
+      let out = Number(value);
+      while (out > 180) out -= 360;
+      while (out <= -180) out += 360;
+      return out;
+    }
+
+    function median(values) {
+      if (!values || values.length === 0) return null;
+      const sorted = [...values].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      if (sorted.length % 2 === 1) return sorted[mid];
+      return (sorted[mid - 1] + sorted[mid]) / 2;
+    }
+
+    function mad(values, center) {
+      if (!values || values.length === 0) return null;
+      const c = center == null ? median(values) : center;
+      if (c == null) return null;
+      const absDev = values.map((v) => Math.abs(v - c));
+      return median(absDev);
+    }
+
+    function circularToBase(values) {
+      if (!values || values.length === 0) return [];
+      const base = Number(values[0]);
+      return values.map((v) => base + normalizeDeg(Number(v) - base));
+    }
+
+    function parseNumberInput(id, label) {
+      const raw = el(id).value;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) {
+        throw new Error(`${label} 不是有效数字`);
+      }
+      return value;
+    }
+
     function setRobotButtonsDisabled() {
       const enabled = !!robotStateCache?.enabled;
       const busy = !!robotStateCache?.busy;
+      const gravityActive = !!robotStateCache?.gravity_compensation_active;
       robotCommandButtons.forEach((btn) => {
         const cmd = btn.dataset.command;
         const isEstop = cmd === "estop";
+        const isDisable = cmd === "disable";
+        const isResetClear = cmd === "reset_clear_errors";
+        const isGravityEnable = cmd === "enable_gravity_compensation";
+        const isGravityDisable = cmd === "disable_gravity_compensation";
         if (!enabled) {
-          btn.disabled = !isEstop;
+          btn.disabled = !(isEstop || isDisable || isResetClear);
           return;
         }
-        btn.disabled = busy && !isEstop;
+        if (busy && !(isEstop || isDisable || isResetClear)) {
+          btn.disabled = true;
+          return;
+        }
+        if (isGravityEnable) {
+          btn.disabled = gravityActive;
+          return;
+        }
+        if (isGravityDisable) {
+          btn.disabled = !gravityActive;
+          return;
+        }
+        if (gravityActive && GRAVITY_INTERLOCKED_COMMANDS.has(cmd || "")) {
+          btn.disabled = true;
+          return;
+        }
+        btn.disabled = false;
       });
+    }
+
+    function setAuxControlsDisabled() {
+      const enabled = !!robotStateCache?.enabled;
+      const busy = !!robotStateCache?.busy;
+
+      el("applySpeedBtn").disabled = !enabled || busy;
+      el("applyRandomBtn").disabled = !enabled || busy;
+      el("clearRandomBtn").disabled = !enabled || busy;
+      el("fillFromLiveBtn").disabled = !enabled || busy;
+
+      el("dynamicStartBtn").disabled = !enabled || busy || dynamicState.active;
+      el("dynamicStopBtn").disabled = !enabled || busy || !dynamicState.active;
+      el("dynamicSaveBtn").disabled = !enabled || busy || !dynamicState.active || !dynamicState.stableSnapshot;
     }
 
     function setRobotBadge(text, cls) {
@@ -274,6 +503,8 @@
     }
 
     function updateView(data) {
+      latestVisionData = data ?? null;
+
       const status = data?.status ?? "-";
       el("status").textContent = status;
       el("status").className = "v " + (status === "ok" ? "ok" : "warn");
@@ -306,6 +537,9 @@
 
       el("fps").textContent = data?.timing?.fps != null ? fmt(data.timing.fps, 2) : "-";
       el("raw").textContent = JSON.stringify(data ?? {}, null, 2);
+
+      updateDynamicStability(data);
+      renderDynamicPanel();
     }
 
     async function refreshHealth() {
@@ -333,6 +567,9 @@
       const j7Deg = toDeg(j7Rad);
       const step = data?.step_progress ?? {};
       const last = data?.last_result ?? {};
+      const gravityActive = !!data?.gravity_compensation_active;
+      const ctrlMode = Number.isFinite(Number(data?.ctrl_mode)) ? Number(data.ctrl_mode) : null;
+      const ctrlModeLabel = data?.ctrl_mode_label ?? "-";
 
       el("robotEnabled").textContent = enabled ? "启用" : "禁用";
       el("robotEnabled").className = "v " + (enabled ? "ok" : "warn");
@@ -342,6 +579,29 @@
 
       el("robotBusy").textContent = busy ? "执行中" : "空闲";
       el("robotBusy").className = "v " + (busy ? "warn" : "ok");
+
+      const speed = data?.speed_percent;
+      el("robotSpeed").textContent = speed != null ? `${speed}%` : "-";
+      if (speed != null) {
+        el("speedSlider").value = String(Math.max(1, Math.min(100, Number(speed))));
+        el("speedNumber").value = String(Math.max(1, Math.min(100, Number(speed))));
+      }
+
+      el("robotGravity").textContent = gravityActive ? "已开启" : "已关闭";
+      el("robotGravity").className = "v " + (gravityActive ? "warn" : "ok");
+      el("robotCtrlMode").textContent = ctrlMode == null ? String(ctrlModeLabel) : `${ctrlModeLabel} (${ctrlMode})`;
+      el("robotCtrlMode").className = "v " + (gravityActive ? "warn" : "");
+
+      const overrideActive = !!data?.pick_override_active;
+      const overrideMode = data?.pick_override_mode ?? "none";
+      const overrideSmooth = data?.pick_override_smooth_segments;
+      if (overrideActive) {
+        el("robotOverride").textContent = `${overrideMode} / close=${fmt(data?.pick_override_close_width, 3)} / force=${fmt(data?.pick_override_force, 2)} / seg=${overrideSmooth ?? "-"}`;
+        el("robotOverride").className = "v warn";
+      } else {
+        el("robotOverride").textContent = "无";
+        el("robotOverride").className = "v ok";
+      }
 
       if (j7Deg == null) {
         el("robotJ7").textContent = "-";
@@ -364,6 +624,8 @@
         setRobotBadge("机械臂控制禁用", "warn");
       } else if (busy) {
         setRobotBadge("机械臂执行中", "warn");
+      } else if (gravityActive) {
+        setRobotBadge("重力补偿模式已开启", "warn");
       } else if (connected) {
         setRobotBadge("机械臂已连接", "ok");
       } else {
@@ -371,6 +633,8 @@
       }
 
       setRobotButtonsDisabled();
+      setAuxControlsDisabled();
+      renderDynamicPanel();
     }
 
     async function parseErrorResponse(resp) {
@@ -397,6 +661,7 @@
           if (errInfo.status === 403 && detailLower.includes("loopback")) {
             robotStateCache = null;
             setRobotButtonsDisabled();
+            setAuxControlsDisabled();
             setRobotBadge("机械臂控制仅本机可用", "warn");
             el("robotOutput").textContent = "当前仅允许本机控制，请用 --allow-lan-robot-control 重启服务";
             return;
@@ -411,44 +676,325 @@
       }
     }
 
-    async function sendRobotCommand(command) {
+    async function sendRobotCommand(command, params = null) {
       if (!command) return;
       try {
+        const payload = { command };
+        if (params && typeof params === "object") {
+          payload.params = params;
+        }
         const resp = await fetch("/api/robot/command", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ command }),
+          body: JSON.stringify(payload),
         });
 
-        let payload = null;
+        let body = null;
         try {
-          payload = await resp.json();
+          body = await resp.json();
         } catch (_) {
-          payload = { message: await resp.text() };
+          body = { message: await resp.text() };
         }
 
         if (!resp.ok) {
-          throw new Error(payload?.detail || payload?.message || `HTTP ${resp.status}`);
+          throw new Error(body?.detail || body?.message || `HTTP ${resp.status}`);
         }
 
-        const lines = payload?.stdout_lines ?? [];
-        const header = `${payload?.command || command}: ${payload?.message || "done"}`;
-        const body = lines.length > 0 ? lines.join("\n") : "(no stdout)";
-        el("robotOutput").textContent = `${header}\n\n${body}`;
+        const lines = body?.stdout_lines ?? [];
+        const header = `${body?.command || command}: ${body?.message || "done"}`;
+        const output = lines.length > 0 ? lines.join("\n") : "(no stdout)";
+        el("robotOutput").textContent = `${header}\n\n${output}`;
       } catch (err) {
         el("robotOutput").textContent = `${command}: ${String(err)}`;
       } finally {
-        refreshRobotState();
+        await refreshRobotState();
       }
+    }
+
+    function updateDynamicStability(data) {
+      if (!dynamicState.active) {
+        dynamicState.window = [];
+        dynamicState.stableSnapshot = null;
+        dynamicState.latestReason = "未启动";
+        return;
+      }
+
+      const sample = extractDynamicSample(data);
+      if (!sample) {
+        dynamicState.window = [];
+        dynamicState.stableSnapshot = null;
+        dynamicState.latestReason = "等待满足条件的 live 抓取帧";
+        return;
+      }
+
+      if (dynamicState.window.length > 0 && dynamicState.window[0].className !== sample.className) {
+        dynamicState.window = [sample];
+      } else {
+        dynamicState.window.push(sample);
+        if (dynamicState.window.length > DYNAMIC_WINDOW) {
+          dynamicState.window = dynamicState.window.slice(dynamicState.window.length - DYNAMIC_WINDOW);
+        }
+      }
+
+      const stats = evaluateDynamicWindow(dynamicState.window);
+      dynamicState.latestReason = stats.reason;
+
+      if (stats.stable) {
+        dynamicState.stableSnapshot = {
+          className: stats.className,
+          conf: stats.confMedian,
+          x_mm: stats.xMedian,
+          y_mm: stats.yMedian,
+          z_mm: stats.zMedian,
+          yaw_deg: stats.yawMedian,
+          axis_quality: stats.axisQualityMedian,
+          mad_x: stats.xMad,
+          mad_y: stats.yMad,
+          mad_z: stats.zMad,
+          mad_yaw: stats.yawMad,
+        };
+      } else {
+        dynamicState.stableSnapshot = null;
+      }
+    }
+
+    function extractDynamicSample(data) {
+      if (!data || data.status !== "ok") return null;
+      const cls = data?.target?.class_name;
+      const conf = Number(data?.target?.conf);
+      const grasp = data?.grasp;
+      if (!cls || !grasp) return null;
+
+      const axisState = String(grasp.axis_state || "").toLowerCase();
+      if (axisState !== "live") return null;
+
+      const x = Number(grasp.x_mm);
+      const y = Number(grasp.y_mm);
+      const z = Number(grasp.z_mm);
+      const yaw = Number(grasp.yaw_deg);
+      const axisQuality = Number(grasp.axis_quality);
+      if (![x, y, z, yaw, conf, axisQuality].every((v) => Number.isFinite(v))) {
+        return null;
+      }
+
+      return {
+        className: String(cls),
+        conf,
+        x,
+        y,
+        z,
+        yaw,
+        axisQuality,
+      };
+    }
+
+    function evaluateDynamicWindow(windowSamples) {
+      if (!windowSamples || windowSamples.length < DYNAMIC_WINDOW) {
+        return { stable: false, reason: `窗口未满 ${windowSamples.length}/${DYNAMIC_WINDOW}` };
+      }
+
+      const className = windowSamples[0].className;
+      if (!windowSamples.every((item) => item.className === className)) {
+        return { stable: false, reason: "类别不一致" };
+      }
+
+      const xs = windowSamples.map((s) => s.x);
+      const ys = windowSamples.map((s) => s.y);
+      const zs = windowSamples.map((s) => s.z);
+      const confs = windowSamples.map((s) => s.conf);
+      const qualities = windowSamples.map((s) => s.axisQuality);
+      const yawsWrapped = circularToBase(windowSamples.map((s) => s.yaw));
+
+      const xMedian = median(xs);
+      const yMedian = median(ys);
+      const zMedian = median(zs);
+      const yawMedianWrapped = median(yawsWrapped);
+      const yawMedian = normalizeDeg(yawMedianWrapped == null ? 0 : yawMedianWrapped);
+      const confMedian = median(confs);
+      const axisQualityMedian = median(qualities);
+
+      const xMad = mad(xs, xMedian);
+      const yMad = mad(ys, yMedian);
+      const zMad = mad(zs, zMedian);
+      const yawMad = mad(yawsWrapped, yawMedianWrapped);
+
+      if (axisQualityMedian == null || axisQualityMedian < DYNAMIC_MIN_AXIS_QUALITY) {
+        return { stable: false, reason: `axis_quality中位数不足(${fmt(axisQualityMedian, 3)})` };
+      }
+      if (xMad == null || xMad > DYNAMIC_MAD_LIMIT.x) {
+        return { stable: false, reason: `X MAD超限(${fmt(xMad, 2)}mm)` };
+      }
+      if (yMad == null || yMad > DYNAMIC_MAD_LIMIT.y) {
+        return { stable: false, reason: `Y MAD超限(${fmt(yMad, 2)}mm)` };
+      }
+      if (zMad == null || zMad > DYNAMIC_MAD_LIMIT.z) {
+        return { stable: false, reason: `Z MAD超限(${fmt(zMad, 2)}mm)` };
+      }
+      if (yawMad == null || yawMad > DYNAMIC_MAD_LIMIT.yaw) {
+        return { stable: false, reason: `Yaw MAD超限(${fmt(yawMad, 2)}deg)` };
+      }
+      if (!!robotStateCache?.busy) {
+        return { stable: false, reason: "机械臂执行中，暂不允许保存" };
+      }
+
+      return {
+        stable: true,
+        reason: "稳定可保存",
+        className,
+        xMedian,
+        yMedian,
+        zMedian,
+        yawMedian,
+        confMedian,
+        axisQualityMedian,
+        xMad,
+        yMad,
+        zMad,
+        yawMad,
+      };
+    }
+
+    function renderDynamicPanel() {
+      const data = latestVisionData;
+      const liveClass = data?.target?.class_name ?? "-";
+      const liveConf = data?.target?.conf != null ? fmt(data.target.conf, 3) : "-";
+      const liveGrasp = data?.grasp
+        ? `${fmt(data.grasp.x_mm, 1)}, ${fmt(data.grasp.y_mm, 1)}, ${fmt(data.grasp.z_mm, 1)} / yaw=${fmt(data.grasp.yaw_deg, 1)}`
+        : "-";
+
+      el("dynamicModeState").textContent = dynamicState.active ? "运行中" : "未启动";
+      el("dynamicModeState").className = "v " + (dynamicState.active ? "warn" : "ok");
+      el("dynamicLiveClass").textContent = liveClass;
+      el("dynamicLiveConf").textContent = liveConf;
+      el("dynamicLiveGrasp").textContent = liveGrasp;
+      el("dynamicWindow").textContent = `${dynamicState.window.length}/${DYNAMIC_WINDOW}`;
+
+      if (dynamicState.stableSnapshot) {
+        const s = dynamicState.stableSnapshot;
+        el("dynamicStableState").textContent = `已稳定 (${dynamicState.latestReason})`;
+        el("dynamicStableState").className = "v ok";
+        el("dynamicStablePoint").textContent = `${fmt(s.x_mm, 2)}, ${fmt(s.y_mm, 2)}, ${fmt(s.z_mm, 2)} / yaw=${fmt(s.yaw_deg, 2)}`;
+      } else {
+        el("dynamicStableState").textContent = dynamicState.latestReason || "未稳定";
+        el("dynamicStableState").className = "v warn";
+        el("dynamicStablePoint").textContent = "-";
+      }
+
+      setAuxControlsDisabled();
     }
 
     function bindRobotButtons() {
       robotCommandButtons.forEach((btn) => {
         btn.addEventListener("click", () => {
+          const confirmText = btn.dataset.confirm;
+          if (confirmText && !window.confirm(confirmText)) {
+            return;
+          }
           sendRobotCommand(btn.dataset.command || "");
         });
       });
       setRobotButtonsDisabled();
+    }
+
+    function bindSpeedControls() {
+      const slider = el("speedSlider");
+      const input = el("speedNumber");
+      slider.addEventListener("input", () => {
+        input.value = slider.value;
+      });
+      input.addEventListener("input", () => {
+        const value = Math.max(1, Math.min(100, Number(input.value || 1)));
+        slider.value = String(value);
+      });
+
+      el("applySpeedBtn").addEventListener("click", () => {
+        const value = Math.max(1, Math.min(100, Number(input.value || slider.value || 30)));
+        slider.value = String(value);
+        input.value = String(value);
+        sendRobotCommand("set_speed_percent", { percent: value });
+      });
+    }
+
+    function bindRandomControls() {
+      el("fillFromLiveBtn").addEventListener("click", () => {
+        const g = latestVisionData?.grasp;
+        if (!g) {
+          el("robotOutput").textContent = "fill_from_live: 当前没有可用抓取点";
+          return;
+        }
+        el("randomX").value = String(g.x_mm ?? "");
+        el("randomY").value = String(g.y_mm ?? "");
+        el("randomZ").value = String(g.z_mm ?? "");
+        el("randomYaw").value = String(g.yaw_deg ?? "");
+      });
+
+      el("applyRandomBtn").addEventListener("click", () => {
+        try {
+          const params = {
+            x_mm: parseNumberInput("randomX", "随机测试X"),
+            y_mm: parseNumberInput("randomY", "随机测试Y"),
+            z_mm: parseNumberInput("randomZ", "随机测试Z"),
+            yaw_deg: parseNumberInput("randomYaw", "随机测试Yaw"),
+            close_width: parseNumberInput("randomCloseWidth", "随机测试关夹爪宽度"),
+            force: parseNumberInput("randomForce", "随机测试力度"),
+            smooth_segments: Math.max(1, Math.min(10, Math.round(parseNumberInput("randomSegments", "随机测试平滑分段")))),
+            mode: "random",
+          };
+          sendRobotCommand("apply_pick_override_from_vision", params);
+        } catch (err) {
+          el("robotOutput").textContent = `apply_random: ${String(err)}`;
+        }
+      });
+
+      el("clearRandomBtn").addEventListener("click", () => {
+        sendRobotCommand("clear_pick_override");
+      });
+    }
+
+    function bindDynamicControls() {
+      el("dynamicStartBtn").addEventListener("click", () => {
+        dynamicState.active = true;
+        dynamicState.window = [];
+        dynamicState.stableSnapshot = null;
+        dynamicState.latestReason = "等待稳定窗口";
+        renderDynamicPanel();
+      });
+
+      el("dynamicStopBtn").addEventListener("click", () => {
+        dynamicState.active = false;
+        dynamicState.window = [];
+        dynamicState.stableSnapshot = null;
+        dynamicState.latestReason = "已停止";
+        renderDynamicPanel();
+      });
+
+      el("dynamicSaveBtn").addEventListener("click", () => {
+        if (!dynamicState.stableSnapshot) {
+          el("robotOutput").textContent = "dynamic_save: 当前还未稳定";
+          return;
+        }
+        try {
+          const s = dynamicState.stableSnapshot;
+          const params = {
+            x_mm: s.x_mm,
+            y_mm: s.y_mm,
+            z_mm: s.z_mm,
+            yaw_deg: s.yaw_deg,
+            close_width: parseNumberInput("dynamicCloseWidth", "动态测试关夹爪宽度"),
+            force: parseNumberInput("dynamicForce", "动态测试力度"),
+            smooth_segments: Math.max(1, Math.min(10, Math.round(parseNumberInput("dynamicSegments", "动态测试平滑分段")))),
+            mode: "dynamic",
+          };
+          dynamicState.active = false;
+          dynamicState.window = [];
+          dynamicState.stableSnapshot = null;
+          dynamicState.latestReason = "已保存，等待逐步执行";
+          renderDynamicPanel();
+          sendRobotCommand("apply_pick_override_from_vision", params);
+        } catch (err) {
+          el("robotOutput").textContent = `dynamic_save: ${String(err)}`;
+        }
+      });
     }
 
     function connectWs() {
@@ -463,9 +1009,13 @@
     }
 
     bindRobotButtons();
+    bindSpeedControls();
+    bindRandomControls();
+    bindDynamicControls();
     connectWs();
     refreshHealth();
     refreshRobotState();
+    renderDynamicPanel();
 
     setInterval(refreshHealth, 2000);
     setInterval(refreshRobotState, 1000);

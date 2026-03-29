@@ -13,6 +13,7 @@ class StubManager:
             "enabled": True,
             "connected": False,
             "busy": False,
+            "speed_percent": 30,
             "joint_positions_rad": None,
             "flange_pose_m_rad": None,
             "diag": {},
@@ -28,6 +29,7 @@ class StubManager:
                 "command": "",
                 "message": "idle",
                 "stdout_lines": [],
+                "error_code": None,
                 "step_progress": {
                     "active": False,
                     "index": 0,
@@ -37,12 +39,21 @@ class StubManager:
                 },
                 "diag": {},
             },
+            "pick_override_active": False,
+            "pick_override_mode": "none",
+            "pick_override_close_width": None,
+            "pick_override_force": None,
+            "pick_override_smooth_segments": None,
+            "gravity_compensation_active": False,
+            "ctrl_mode": None,
+            "ctrl_mode_label": "未知",
         }
         self.next_result = {
             "ok": True,
             "command": "status",
             "message": "ok",
             "stdout_lines": [],
+            "error_code": None,
             "step_progress": {
                 "active": False,
                 "index": 0,
@@ -56,7 +67,8 @@ class StubManager:
     def get_state(self):
         return dict(self.state)
 
-    def execute_command(self, command: str):
+    def execute_command(self, command: str, params=None):
+        _ = params
         out = dict(self.next_result)
         out["command"] = command
         return out
@@ -112,6 +124,7 @@ def test_robot_command_busy_raises_conflict() -> None:
         "command": "status",
         "message": "robot is busy",
         "stdout_lines": [],
+        "error_code": None,
         "step_progress": {
             "active": False,
             "index": 0,
@@ -127,6 +140,56 @@ def test_robot_command_busy_raises_conflict() -> None:
     with pytest.raises(Exception) as exc:
         endpoint(RobotCommandRequest(command="status"), _fake_request("10.0.0.5"))
     assert "409" in str(exc.value)
+
+
+def test_robot_command_gravity_interlock_raises_conflict() -> None:
+    manager = StubManager()
+    manager.next_result = {
+        "ok": False,
+        "command": "home",
+        "message": "gravity compensation is active; disable it before motion commands",
+        "stdout_lines": [],
+        "error_code": "gravity_interlock",
+        "step_progress": {
+            "active": False,
+            "index": 0,
+            "total": 0,
+            "next_label": None,
+            "last_label": None,
+        },
+        "diag": {},
+    }
+    router = build_robot_router(manager=manager, enabled=True, loopback_only=False)
+    endpoint = _resolve_endpoint(router, "/api/robot/command", "POST")
+
+    with pytest.raises(Exception) as exc:
+        endpoint(RobotCommandRequest(command="home"), _fake_request("10.0.0.5"))
+    assert "409" in str(exc.value)
+
+
+def test_robot_command_invalid_params_raises_bad_request() -> None:
+    manager = StubManager()
+    manager.next_result = {
+        "ok": False,
+        "command": "set_speed_percent",
+        "message": "invalid params: percent must be between 1 and 100",
+        "stdout_lines": [],
+        "error_code": "invalid_params",
+        "step_progress": {
+            "active": False,
+            "index": 0,
+            "total": 0,
+            "next_label": None,
+            "last_label": None,
+        },
+        "diag": {},
+    }
+    router = build_robot_router(manager=manager, enabled=True, loopback_only=False)
+    endpoint = _resolve_endpoint(router, "/api/robot/command", "POST")
+
+    with pytest.raises(Exception) as exc:
+        endpoint(RobotCommandRequest(command="set_speed_percent", params={"percent": 101}), _fake_request("10.0.0.5"))
+    assert "400" in str(exc.value)
 
 
 def test_robot_endpoint_loopback_only_rejects_non_loopback() -> None:

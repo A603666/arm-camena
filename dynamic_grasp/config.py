@@ -15,6 +15,13 @@ class VisionConfig:
     poll_hz: float
     health_timeout_sec: float
     target_stable_frames: int
+    stable_pos_tol_mm: float
+    stable_z_tol_mm: float
+    stable_yaw_tol_deg: float
+    plan_buffer_frames: int
+    max_replan_jump_mm: float
+    min_quality_score: float
+    reject_on_quality_drop: bool
 
 
 @dataclass(frozen=True)
@@ -36,7 +43,7 @@ class GraspConfig:
     open_width_m: float
     close_width_m: float
     force_n: float
-    hover_clearance_m: float
+    prepick_offset_m: float
     final_z_offset_m: float
     max_descent_m: float
     min_safe_z_m: float
@@ -108,6 +115,18 @@ def _as_path(config_path: Path, raw: Any, default: str | Path) -> Path:
     return path
 
 
+def _as_bool(section: dict[str, Any], key: str, default: bool) -> bool:
+    raw = section.get(key, default)
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid bool for {key}: {raw!r}")
+
+
 def _normalize_width_range(raw: Any) -> tuple[float, float]:
     if isinstance(raw, (int, float)):
         high = float(raw)
@@ -124,7 +143,13 @@ def _normalize_width_range(raw: Any) -> tuple[float, float]:
 def load_app_config(path: str | Path) -> AppConfig:
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    root = _require_dict(raw, "root")
+    root_raw = _require_dict(raw, "root")
+    using_unified_root = False
+    if "dynamic_grasp" in root_raw:
+        root = _require_dict(root_raw.get("dynamic_grasp"), "dynamic_grasp")
+        using_unified_root = True
+    else:
+        root = root_raw
 
     vision = _require_section(root, "vision")
     handeye = _require_section(root, "handeye")
@@ -132,14 +157,27 @@ def load_app_config(path: str | Path) -> AppConfig:
     grasp = _require_section(root, "grasp")
     route = _require_section(root, "route")
     runtime = _require_section(root, "runtime")
+    if "prepick_offset_m" in grasp:
+        prepick_offset_m = max(0.0, _as_float(grasp, "prepick_offset_m", 0.05))
+    elif "hover_clearance_m" in grasp:
+        prepick_offset_m = max(0.0, _as_float(grasp, "hover_clearance_m", 0.05))
+    else:
+        prepick_offset_m = 0.05
 
     return AppConfig(
         config_path=config_path,
         vision=VisionConfig(
             base_url=str(vision.get("base_url", "http://127.0.0.1:18000")).rstrip("/"),
-            poll_hz=max(0.5, _as_float(vision, "poll_hz", 5.0)),
+            poll_hz=max(0.5, _as_float(vision, "poll_hz", 12.0)),
             health_timeout_sec=max(0.2, _as_float(vision, "health_timeout_sec", 2.0)),
             target_stable_frames=max(1, _as_int(vision, "target_stable_frames", 3)),
+            stable_pos_tol_mm=max(0.1, _as_float(vision, "stable_pos_tol_mm", 5.0)),
+            stable_z_tol_mm=max(0.1, _as_float(vision, "stable_z_tol_mm", 5.0)),
+            stable_yaw_tol_deg=max(0.1, _as_float(vision, "stable_yaw_tol_deg", 5.0)),
+            plan_buffer_frames=max(1, min(10, _as_int(vision, "plan_buffer_frames", 3))),
+            max_replan_jump_mm=max(1.0, _as_float(vision, "max_replan_jump_mm", 25.0)),
+            min_quality_score=max(0.0, min(1.0, _as_float(vision, "min_quality_score", 0.50))),
+            reject_on_quality_drop=_as_bool(vision, "reject_on_quality_drop", True),
         ),
         handeye=HandEyeConfig(
             mode=str(handeye.get("mode", "nominal")).strip().lower() or "nominal",
@@ -159,7 +197,7 @@ def load_app_config(path: str | Path) -> AppConfig:
             open_width_m=max(0.0, _as_float(grasp, "open_width_m", 0.05)),
             close_width_m=max(0.0, _as_float(grasp, "close_width_m", 0.0)),
             force_n=max(0.0, _as_float(grasp, "force_n", 1.0)),
-            hover_clearance_m=max(0.0, _as_float(grasp, "hover_clearance_m", 0.05)),
+            prepick_offset_m=prepick_offset_m,
             final_z_offset_m=_as_float(grasp, "final_z_offset_m", 0.0),
             max_descent_m=max(0.01, _as_float(grasp, "max_descent_m", 0.35)),
             min_safe_z_m=max(0.0, _as_float(grasp, "min_safe_z_m", 0.10)),
@@ -179,7 +217,11 @@ def load_app_config(path: str | Path) -> AppConfig:
             arm_config_path=_as_path(
                 config_path,
                 runtime.get("arm_config_path"),
-                ROOT_DIR / "robot_runtime" / "config" / "default.yaml",
+                (
+                    config_path
+                    if using_unified_root
+                    else ROOT_DIR / "robot_runtime" / "config" / "default.yaml"
+                ),
             ),
             speed_percent=max(1, min(100, _as_int(runtime, "speed_percent", 35))),
             move_timeout_sec=max(1.0, _as_float(runtime, "move_timeout_sec", 30.0)),

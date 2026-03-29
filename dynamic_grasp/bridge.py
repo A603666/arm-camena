@@ -37,6 +37,8 @@ def _load_arm_config(path: Path) -> dict[str, Any]:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"arm config must be a mapping: {path}")
+    if isinstance(raw.get("robot_runtime"), dict):
+        raw = dict(raw.get("robot_runtime"))
     for key in ("pyagxarm_repo", "waypoint_file"):
         value = raw.get(key)
         if isinstance(value, str) and value.strip():

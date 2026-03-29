@@ -65,11 +65,7 @@ def resolve_geom_backend(requested: str | None, torch_cuda_available: bool, cuml
         if torch_cuda_available:
             return "torch"
         return "cpu"
-
-    if cuml_available:
-        return "cuml"
-    if torch_cuda_available:
-        return "torch"
+    # Conservative default for Jetson runtime: keep auto on CPU unless explicitly requested.
     return "cpu"
 
 
@@ -456,6 +452,8 @@ class TorchCudaBackend(CPUReferenceBackend):
             major_max = float(torch.max(proj_major).item())
             half_window = float(window_length_mm) / 2.0
             best_score = -1e18
+            best_center_abs = float("inf")
+            center_bias_weight = 0.08
 
             c = major_min
             while c <= major_max:
@@ -465,9 +463,11 @@ class TorchCudaBackend(CPUReferenceBackend):
                     local_minor = proj_minor[local_mask]
                     local_width = float(torch.quantile(local_minor, q=0.95).item() - torch.quantile(local_minor, q=0.05).item())
                     if local_width <= float(width_limit_mm):
-                        score = float(local_count) - local_width * 0.5
-                        if score > best_score:
+                        center_abs = abs(float(c))
+                        score = float(local_count) - local_width * 0.5 - center_bias_weight * center_abs
+                        if score > best_score or (abs(score - best_score) < 1e-6 and center_abs < best_center_abs):
                             best_score = score
+                            best_center_abs = center_abs
                             selected_mask = local_mask
                 c += float(step_mm)
 

@@ -35,6 +35,9 @@ TAG_ENABLE_OK = "ENABLE_OK"
 TAG_RECOVERING = "RECOVERING"
 TAG_RECOVERED = "RECOVERED"
 TAG_ENABLE_TIMEOUT = "ENABLE_TIMEOUT"
+ENABLE_READINESS_POLL_SEC = 0.1
+ENABLE_POLL_SEC = 0.2
+ENABLE_PROGRESS_GRACE_SEC = 3.0
 
 REQUIRED_KEYS = [
     "can_channel",
@@ -74,25 +77,38 @@ def load_config(path: Path) -> DaemonConfig:
     if not isinstance(raw, dict):
         raise ValueError("config root must be a mapping")
 
-    missing = [k for k in REQUIRED_KEYS if k not in raw]
+    cfg_root = raw
+    if isinstance(raw.get("auto_enable"), dict):
+        cfg_root = dict(raw.get("auto_enable"))
+        robot_runtime = raw.get("robot_runtime")
+        if isinstance(robot_runtime, dict):
+            for key in ("can_channel", "can_bitrate", "can_interface"):
+                cfg_root.setdefault(key, robot_runtime.get(key))
+            can_tools = robot_runtime.get("can_tools")
+            if isinstance(can_tools, dict) and can_tools.get("scripts_dir") and not cfg_root.get("can_scripts_dir"):
+                cfg_root["can_scripts_dir"] = can_tools.get("scripts_dir")
+
+    missing = [k for k in REQUIRED_KEYS if k not in cfg_root]
     if missing:
         raise ValueError(f"missing required config keys: {', '.join(missing)}")
 
-    can_channel = str(raw["can_channel"]).strip()
-    can_bitrate = int(raw["can_bitrate"])
-    can_interface = str(raw["can_interface"]).strip()
-    usb_bus_info = str(raw["usb_bus_info"]).strip()
-    can_scripts_dir = Path(str(raw["can_scripts_dir"])).expanduser()
+    can_channel = str(cfg_root["can_channel"]).strip()
+    can_bitrate = int(cfg_root["can_bitrate"])
+    can_interface = str(cfg_root["can_interface"]).strip()
+    usb_bus_info = str(cfg_root["usb_bus_info"]).strip()
+    can_scripts_dir = Path(str(cfg_root["can_scripts_dir"])).expanduser()
     if not can_scripts_dir.is_absolute():
         can_scripts_dir = (path.parent / can_scripts_dir).resolve()
     else:
         can_scripts_dir = can_scripts_dir.resolve()
-    retry_interval_sec = float(raw["retry_interval_sec"])
-    enable_timeout_sec = float(raw["enable_timeout_sec"])
-    health_check_sec = float(raw["health_check_sec"])
+    retry_interval_sec = float(cfg_root["retry_interval_sec"])
+    enable_timeout_sec = float(cfg_root["enable_timeout_sec"])
+    health_check_sec = float(cfg_root["health_check_sec"])
 
     if not can_channel:
         raise ValueError("can_channel must not be empty")
+    if can_channel != "can0":
+        raise ValueError(f"can_channel must be can0 for USB-CAN deployment (got: {can_channel})")
     if can_bitrate <= 0:
         raise ValueError("can_bitrate must be > 0")
     if not can_interface:
@@ -248,20 +264,79 @@ def get_joint_flags(robot: Any) -> Optional[list[bool]]:
     return None
 
 
-def ensure_enabled(robot: Any, timeout_sec: float) -> bool:
-    deadline = time.time() + timeout_sec
+def has_joint_feedback(robot: Any) -> bool:
+    if not hasattr(robot, "get_joint_angles"):
+        return False
+    try:
+        joints = robot.get_joint_angles()
+    except Exception:
+        return False
+    return bool(joints is not None and hasattr(joints, "msg"))
+
+
+def wait_joint_ready(robot: Any, timeout_sec: float) -> bool:
+    deadline = time.time() + max(0.0, timeout_sec)
     while time.time() < deadline:
-        flags = get_joint_flags(robot)
-        if flags is not None and all(flags):
+        if get_joint_flags(robot) is not None:
             return True
+        if has_joint_feedback(robot):
+            return True
+        time.sleep(ENABLE_READINESS_POLL_SEC)
+    return bool(get_joint_flags(robot) is not None or has_joint_feedback(robot))
+
+
+def _classify_enable_timeout(flags: Optional[list[bool]]) -> str:
+    if flags is None:
+        return "no_feedback"
+    enabled_count = sum(1 for flag in flags if flag)
+    if enabled_count == 0:
+        return "all_disabled"
+    return "partial_enabled"
+
+
+def _format_flags(flags: Optional[list[bool]]) -> str:
+    if flags is None:
+        return "unknown"
+    return "".join("1" if flag else "0" for flag in flags)
+
+
+def ensure_enabled(
+    robot: Any,
+    timeout_sec: float,
+    progress_grace_sec: float = ENABLE_PROGRESS_GRACE_SEC,
+) -> Tuple[bool, Optional[list[bool]], str]:
+    deadline = time.time() + timeout_sec
+    grace_deadline: Optional[float] = None
+    last_flags: Optional[list[bool]] = None
+    while True:
+        now = time.time()
+        flags = get_joint_flags(robot)
+        if flags is not None:
+            last_flags = flags
+            if all(flags):
+                return True, flags, ""
+            if any(flags) and grace_deadline is None and now >= deadline and progress_grace_sec > 0:
+                grace_deadline = now + progress_grace_sec
         try:
             if hasattr(robot, "enable") and robot.enable():
-                return True
+                post_flags = get_joint_flags(robot)
+                if post_flags is None or all(post_flags):
+                    return True, post_flags, ""
+                last_flags = post_flags
         except Exception:
             pass
-        time.sleep(0.2)
-    flags = get_joint_flags(robot)
-    return bool(flags is not None and all(flags))
+
+        now = time.time()
+        if now >= deadline:
+            if grace_deadline is None:
+                if last_flags is not None and any(last_flags) and progress_grace_sec > 0:
+                    grace_deadline = now + progress_grace_sec
+                else:
+                    return False, last_flags, _classify_enable_timeout(last_flags)
+            elif now >= grace_deadline:
+                return False, last_flags, _classify_enable_timeout(last_flags)
+
+        time.sleep(ENABLE_POLL_SEC)
 
 
 def establish_robot_session(cfg: DaemonConfig, logger: logging.Logger) -> Tuple[bool, Optional[Any], str]:
@@ -301,15 +376,33 @@ def establish_robot_session(cfg: DaemonConfig, logger: logging.Logger) -> Tuple[
         safe_disconnect(robot, logger)
         return False, None, f"set_normal_mode failed: {exc}"
 
-    if not ensure_enabled(robot, cfg.enable_timeout_sec):
+    ready_wait_sec = min(1.5, max(0.5, cfg.enable_timeout_sec * 0.2))
+    if wait_joint_ready(robot, ready_wait_sec):
+        logger.info("joint feedback became ready after set_normal_mode (wait<=%.1fs)", ready_wait_sec)
+    else:
+        logger.warning(
+            "joint feedback still not ready after set_normal_mode (waited %.1fs), continue enabling",
+            ready_wait_sec,
+        )
+
+    enabled, timeout_flags, timeout_reason = ensure_enabled(
+        robot,
+        cfg.enable_timeout_sec,
+        progress_grace_sec=ENABLE_PROGRESS_GRACE_SEC,
+    )
+    if not enabled:
         log_tag(
             logger,
             TAG_ENABLE_TIMEOUT,
-            f"joint enable timeout after {cfg.enable_timeout_sec:.1f}s",
+            (
+                f"joint enable timeout after {cfg.enable_timeout_sec:.1f}s "
+                f"(reason={timeout_reason}, flags={_format_flags(timeout_flags)}, "
+                f"grace={ENABLE_PROGRESS_GRACE_SEC:.1f}s)"
+            ),
             level=logging.ERROR,
         )
         safe_disconnect(robot, logger)
-        return False, None, "joint enable timeout"
+        return False, None, f"joint enable timeout ({timeout_reason})"
 
     log_tag(logger, TAG_ENABLE_OK, "all joints enabled")
     return True, robot, ""
@@ -328,7 +421,8 @@ def health_check(robot: Any, cfg: DaemonConfig, logger: logging.Logger) -> Tuple
 
     flags = get_joint_flags(robot)
     if flags is not None and not all(flags):
-        if ensure_enabled(robot, min(cfg.enable_timeout_sec, 3.0)):
+        enabled, _, _ = ensure_enabled(robot, min(cfg.enable_timeout_sec, 3.0))
+        if enabled:
             log_tag(logger, TAG_ENABLE_OK, "re-enable success during health check")
             return True, ""
         return False, "joint motors not fully enabled"
@@ -337,12 +431,15 @@ def health_check(robot: Any, cfg: DaemonConfig, logger: logging.Logger) -> Tuple
 
 
 def build_parser() -> argparse.ArgumentParser:
+    unified_default = THIS_DIR.parent / "pipeline_config.yaml"
+    legacy_default = THIS_DIR / "config" / "auto_enable.yaml"
+    default_config = unified_default if unified_default.is_file() else legacy_default
     parser = argparse.ArgumentParser(description="NERO auto CAN push + auto-enable daemon")
     parser.add_argument(
         "--config",
         type=str,
-        default=str(THIS_DIR / "config" / "auto_enable.yaml"),
-        help="Path to daemon config yaml",
+        default=str(default_config),
+        help="Path to daemon config yaml (legacy auto_enable.yaml or unified pipeline_config.yaml)",
     )
     parser.add_argument(
         "--once",

@@ -11,6 +11,7 @@ from .robot_control import ALLOWED_COMMANDS, RobotControlManager
 
 class RobotCommandRequest(BaseModel):
     command: str
+    params: dict[str, Any] | None = None
 
 
 def _is_loopback_host(host: str | None) -> bool:
@@ -50,12 +51,17 @@ def build_robot_router(manager: RobotControlManager, enabled: bool, loopback_onl
         if normalized not in ALLOWED_COMMANDS:
             raise HTTPException(status_code=400, detail="unsupported command")
 
-        result = manager.execute_command(payload.command)
+        result = manager.execute_command(payload.command, payload.params)
         result["allowed_commands"] = sorted(ALLOWED_COMMANDS)
         result["enabled"] = bool(enabled)
 
         ok = bool(result.get("ok", False))
         message = str(result.get("message", ""))
+        error_code = str(result.get("error_code", "") or "")
+        if not ok and error_code == "invalid_params":
+            raise HTTPException(status_code=400, detail=message or "invalid params")
+        if not ok and error_code == "gravity_interlock":
+            raise HTTPException(status_code=409, detail=message or "gravity compensation interlock active")
         if not ok and message == "robot is busy":
             raise HTTPException(status_code=409, detail=message)
         if not ok and message == "robot web control disabled":

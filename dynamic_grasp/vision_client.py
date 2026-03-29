@@ -28,11 +28,17 @@ class VisionSnapshot:
     axis_dir_optical: tuple[float, float, float] | None
     target_center_depth_m: float | None
     width_m: float | None
+    source_quality_score: float | None
+    quality_flags: tuple[str, ...]
     raw: dict[str, Any]
 
     @property
     def is_trackable(self) -> bool:
         return self.status == "ok" and self.grasp_point_optical_m is not None and self.axis_dir_optical is not None
+
+    @property
+    def quality_ok(self) -> bool:
+        return self.source_quality_score is not None and self.source_quality_score >= 0.0 and not self.quality_flags
 
     def signature(self) -> tuple[Any, ...]:
         point = None
@@ -73,6 +79,25 @@ class VisionSnapshot:
         if isinstance(size, dict) and size.get("width_mm") is not None:
             width_m = float(size["width_mm"]) / 1000.0
 
+        source_quality_score: float | None = None
+        quality_flags: tuple[str, ...] = ()
+        segmentation = payload.get("segmentation")
+        if isinstance(segmentation, dict):
+            raw_score = segmentation.get("quality_score")
+            if raw_score is not None:
+                try:
+                    source_quality_score = float(raw_score)
+                except (TypeError, ValueError):
+                    source_quality_score = None
+            raw_flags = segmentation.get("quality_flags")
+            if isinstance(raw_flags, list):
+                quality_flags = tuple(str(flag) for flag in raw_flags if str(flag))
+        if source_quality_score is None and isinstance(grasp, dict) and grasp.get("source_quality_score") is not None:
+            try:
+                source_quality_score = float(grasp.get("source_quality_score"))
+            except (TypeError, ValueError):
+                source_quality_score = None
+
         return cls(
             status=str(payload.get("status", "unknown")),
             bbox_xyxy=bbox_xyxy,
@@ -80,6 +105,8 @@ class VisionSnapshot:
             axis_dir_optical=axis_dir,
             target_center_depth_m=target_center_depth_m,
             width_m=width_m,
+            source_quality_score=source_quality_score,
+            quality_flags=quality_flags,
             raw=dict(payload),
         )
 

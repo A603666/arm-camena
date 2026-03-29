@@ -1,8 +1,15 @@
 vision:
   base_url: http://127.0.0.1:18000
-  poll_hz: 5.0
+  poll_hz: 12.0
   health_timeout_sec: 2.0
   target_stable_frames: 3
+  stable_pos_tol_mm: 5.0
+  stable_z_tol_mm: 5.0
+  stable_yaw_tol_deg: 5.0
+  plan_buffer_frames: 3
+  max_replan_jump_mm: 25.0
+  min_quality_score: 0.50
+  reject_on_quality_drop: true
 
 handeye:
   mode: nominal
@@ -18,7 +25,7 @@ grasp:
   open_width_m: 0.05
   close_width_m: 0.0
   force_n: 1.0
-  hover_clearance_m: 0.05
+  prepick_offset_m: 0.05
   final_z_offset_m: 0.0
   max_descent_m: 0.35
   min_safe_z_m: 0.10

@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DaBai 标定工作台</title>
+  <style>
+    :root {
+      --bg: #f3f6f8;
+      --card: #ffffff;
+      --ink: #1c2630;
+      --line: #d7e0e8;
+      --soft: #607080;
+      --ok: #1f9d55;
+      --warn: #d97706;
+      --danger: #b91c1c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background:
+        radial-gradient(1200px 300px at 20% -10%, #ccebe8 0%, transparent 60%),
+        radial-gradient(900px 240px at 95% 0%, #dae7f5 0%, transparent 60%),
+        var(--bg);
+      color: var(--ink);
+    }
+    .page {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+    }
+    .header, .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+    }
+    .header {
+      padding: 14px 18px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .title { margin: 0; font-size: 22px; }
+    .sub { margin: 4px 0 0; color: var(--soft); font-size: 14px; }
+    .badge {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 13px;
+      background: #f7fbff;
+      color: #334155;
+      white-space: nowrap;
+    }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .danger { color: var(--danger); }
+    .link {
+      text-decoration: none;
+      border: 1px solid #9ac5c0;
+      border-radius: 999px;
+      padding: 6px 12px;
+      background: #e8f7f5;
+      color: #0f4f49;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1.3fr 1fr;
+      gap: 14px;
+    }
+    .card { padding: 12px; }
+    .card h2 { margin: 0 0 10px; font-size: 17px; }
+    .video {
+      width: 100%;
+      border-radius: 10px;
+      border: 1px solid #ccd8e3;
+      background: #0b1220;
+      display: block;
+    }
+    .kv {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px 12px;
+      font-size: 14px;
+    }
+    .kv .k { color: var(--soft); }
+    .kv .v { font-weight: 600; text-align: right; max-width: 280px; overflow-wrap: anywhere; }
+    .actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    button {
+      border: 1px solid #c8d6e2;
+      background: #f8fbfd;
+      color: #183043;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.primary {
+      border-color: #99c8c2;
+      background: #e8f7f5;
+      color: #0f4f49;
+      font-weight: 700;
+    }
+    button.warn-btn {
+      border-color: #ffe6bb;
+      background: #fff8ec;
+      color: #9a5a00;
+      font-weight: 700;
+    }
+    button.danger-btn {
+      border-color: #f1b8b8;
+      background: #fff0f0;
+      color: #9f1d1d;
+      font-weight: 700;
+    }
+    pre {
+      margin: 0;
+      max-height: 360px;
+      overflow: auto;
+      background: #0c1116;
+      color: #d9f3de;
+      padding: 10px;
+      border-radius: 8px;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .hint {
+      margin-top: 8px;
+      color: var(--soft);
+      font-size: 12px;
+    }
+    @media (max-width: 960px) {
+      .grid { grid-template-columns: 1fr; }
+      .actions { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div>
+        <h1 class="title">DaBai 相机内参 + 手眼标定工作台</h1>
+        <p class="sub">标定模式开启后，YOLO 与点云几何分割会暂停，仅保留相机流与棋盘检测</p>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <a class="link" href="/">返回主面板</a>
+        <div id="modeBadge" class="badge">标定模式: 切换中</div>
+        <div id="detectBadge" class="badge">棋盘检测: -</div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>标定预览流</h2>
+        <img id="stream" class="video" src="/stream/calibration" alt="calibration stream" />
+      </div>
+
+      <div class="card">
+        <h2>会话状态</h2>
+        <div class="kv">
+          <div class="k">棋盘规格</div><div id="boardSpec" class="v">-</div>
+          <div class="k">最小样本数</div><div id="minSamples" class="v">-</div>
+          <div class="k">当前样本数</div><div id="sampleCount" class="v">-</div>
+          <div class="k">可计算</div><div id="canCompute" class="v">-</div>
+          <div class="k">可写回</div><div id="canApply" class="v">-</div>
+          <div class="k">RMS</div><div id="rms" class="v">-</div>
+          <div class="k">重投影误差均值</div><div id="reproj" class="v">-</div>
+          <div class="k">目标平移离散</div><div id="transStd" class="v">-</div>
+          <div class="k">目标旋转离散</div><div id="rotStd" class="v">-</div>
+        </div>
+
+        <div class="actions">
+          <button id="captureBtn" class="primary">采样一帧</button>
+          <button id="computeBtn" class="primary">执行标定</button>
+          <button id="applyBtn" class="warn-btn">写回并立即启用</button>
+          <button id="rollbackBtn" class="danger-btn">回滚最近写回</button>
+          <button id="resetBtn">清空当前样本</button>
+          <button id="stopModeBtn">退出标定模式</button>
+        </div>
+        <div class="hint">建议采样 20 组以上，姿态与距离尽量覆盖广。</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>机械臂重力补偿</h2>
+      <div class="kv">
+        <div class="k">控制功能</div><div id="robotEnabled" class="v">-</div>
+        <div class="k">连接状态</div><div id="robotConnected" class="v">-</div>
+        <div class="k">执行状态</div><div id="robotBusy" class="v">-</div>
+        <div class="k">重力补偿</div><div id="gravityState" class="v">-</div>
+        <div class="k">控制模式</div><div id="gravityCtrlMode" class="v">-</div>
+      </div>
+      <div class="actions">
+        <button id="robotEnableBtn" class="primary">机械臂使能</button>
+        <button id="gravityEnableBtn" class="warn-btn">开启重力补偿</button>
+        <button id="gravityDisableBtn">恢复普通模式</button>
+      </div>
+      <div class="hint">开启后机械臂可拖动，请确认机械臂处于安全姿态且周围无人。</div>
+    </div>
+
+    <div class="card">
+      <h2>返回数据 / 日志</h2>
+      <pre id="log">{}</pre>
+    </div>
+  </div>
+
+  <script>
+    const el = (id) => document.getElementById(id);
+    let statusCache = null;
+    let robotStateCache = null;
+
+    function fmt(num, digits = 3) {
+      if (num == null || Number.isNaN(Number(num))) return "-";
+      return Number(num).toFixed(digits);
+    }
+
+    function setLog(obj) {
+      el("log").textContent = JSON.stringify(obj ?? {}, null, 2);
+    }
+
+    async function api(path, method = "POST", body = null) {
+      const resp = await fetch(path, {
+        method,
+        headers: body ? { "Content-Type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      let payload = null;
+      try {
+        payload = await resp.json();
+      } catch (_) {
+        payload = { detail: await resp.text() };
+      }
+      if (!resp.ok) {
+        throw new Error(payload?.detail || payload?.message || `HTTP ${resp.status}`);
+      }
+      return payload;
+    }
+
+    function renderStatus(data) {
+      statusCache = data;
+      const board = data?.board || {};
+      const det = data?.latest_detection || {};
+      const summary = data?.latest_result_summary || {};
+
+      el("boardSpec").textContent = `${board.cols ?? "-"} x ${board.rows ?? "-"} / ${fmt(board.square_size_m, 4)} m`;
+      el("minSamples").textContent = String(data?.min_samples ?? "-");
+      el("sampleCount").textContent = String(data?.sample_count ?? "-");
+      el("canCompute").textContent = data?.can_compute ? "是" : "否";
+      el("canApply").textContent = data?.can_apply ? "是" : "否";
+
+      el("rms").textContent = summary?.rms != null ? fmt(summary.rms, 4) : "-";
+      el("reproj").textContent = summary?.mean_reproj_error_px != null ? `${fmt(summary.mean_reproj_error_px, 4)} px` : "-";
+      el("transStd").textContent = summary?.target_translation_std_mm != null ? `${fmt(summary.target_translation_std_mm, 3)} mm` : "-";
+      el("rotStd").textContent = summary?.target_rotation_std_deg != null ? `${fmt(summary.target_rotation_std_deg, 3)} deg` : "-";
+
+      const modeActive = !!data?.mode_active;
+      const modeBadge = el("modeBadge");
+      modeBadge.textContent = `标定模式: ${modeActive ? "已开启" : "已关闭"}`;
+      modeBadge.className = `badge ${modeActive ? "ok" : "warn"}`;
+
+      const detectBadge = el("detectBadge");
+      const detected = !!det?.found;
+      detectBadge.textContent = `棋盘检测: ${detected ? "已检测" : "未检测"}`;
+      detectBadge.className = `badge ${detected ? "ok" : "warn"}`;
+
+      el("captureBtn").disabled = !modeActive || !detected;
+      el("computeBtn").disabled = !modeActive || !(data?.can_compute);
+      el("applyBtn").disabled = !modeActive || !(data?.can_apply);
+      el("rollbackBtn").disabled = !modeActive || !data?.latest_backup_path;
+      el("resetBtn").disabled = !modeActive;
+      el("stopModeBtn").disabled = !modeActive;
+    }
+
+    function renderRobotAccessLimited(text) {
+      robotStateCache = null;
+      el("robotEnabled").textContent = "不可用";
+      el("robotEnabled").className = "v warn";
+      el("robotConnected").textContent = "-";
+      el("robotConnected").className = "v";
+      el("robotBusy").textContent = "-";
+      el("robotBusy").className = "v";
+      el("gravityState").textContent = text;
+      el("gravityState").className = "v warn";
+      el("gravityCtrlMode").textContent = "-";
+      el("gravityCtrlMode").className = "v";
+      el("robotEnableBtn").disabled = true;
+      el("gravityEnableBtn").disabled = true;
+      el("gravityDisableBtn").disabled = true;
+    }
+
+    function renderRobotState(data) {
+      robotStateCache = data ?? null;
+
+      const enabled = !!data?.enabled;
+      const connected = !!data?.connected;
+      const busy = !!data?.busy;
+      const gravityActive = !!data?.gravity_compensation_active;
+      const ctrlMode = Number.isFinite(Number(data?.ctrl_mode)) ? Number(data.ctrl_mode) : null;
+      const ctrlModeLabel = data?.ctrl_mode_label ?? "-";
+
+      el("robotEnabled").textContent = enabled ? "启用" : "禁用";
+      el("robotEnabled").className = "v " + (enabled ? "ok" : "warn");
+      el("robotConnected").textContent = connected ? "已连接" : "未连接";
+      el("robotConnected").className = "v " + (connected ? "ok" : "warn");
+      el("robotBusy").textContent = busy ? "执行中" : "空闲";
+      el("robotBusy").className = "v " + (busy ? "warn" : "ok");
+
+      el("gravityState").textContent = gravityActive ? "已开启" : "已关闭";
+      el("gravityState").className = "v " + (gravityActive ? "warn" : "ok");
+      el("gravityCtrlMode").textContent = ctrlMode == null ? String(ctrlModeLabel) : `${ctrlModeLabel} (${ctrlMode})`;
+      el("gravityCtrlMode").className = "v " + (gravityActive ? "warn" : "");
+
+      el("robotEnableBtn").disabled = !enabled || busy;
+      el("gravityEnableBtn").disabled = !enabled || busy || gravityActive;
+      el("gravityDisableBtn").disabled = !enabled || busy || !gravityActive;
+    }
+
+    async function refreshStatus() {
+      try {
+        const data = await api("/api/calibration/status", "GET");
+        renderStatus(data);
+      } catch (err) {
+        setLog({ error: String(err) });
+      }
+    }
+
+    async function refreshRobotState() {
+      try {
+        const data = await api("/api/robot/state", "GET");
+        renderRobotState(data);
+      } catch (err) {
+        const message = String(err);
+        if (message.toLowerCase().includes("loopback")) {
+          renderRobotAccessLimited("机械臂控制仅本机可用");
+          return;
+        }
+        renderRobotAccessLimited("机械臂状态读取失败");
+      }
+    }
+
+    async function enableMode() {
+      const out = await api("/api/calibration/mode", "POST", { active: true });
+      setLog(out);
+      await refreshStatus();
+    }
+
+    async function disableMode() {
+      const out = await api("/api/calibration/mode", "POST", { active: false });
+      setLog(out);
+      await refreshStatus();
+    }
+
+    async function setGravityCompensation(active) {
+      const command = active ? "enable_gravity_compensation" : "disable_gravity_compensation";
+      const out = await api("/api/robot/command", "POST", { command });
+      setLog(out);
+      await refreshRobotState();
+    }
+
+    async function enableRobot() {
+      const out = await api("/api/robot/command", "POST", { command: "enable" });
+      setLog(out);
+      await refreshRobotState();
+    }
+
+    async function onCapture() {
+      const out = await api("/api/calibration/capture", "POST");
+      setLog(out);
+      await refreshStatus();
+    }
+
+    async function onCompute() {
+      const out = await api("/api/calibration/compute", "POST");
+      setLog(out);
+      await refreshStatus();
+    }
+
+    async function onApply() {
+      const out = await api("/api/calibration/apply", "POST");
+      setLog(out);
+      await refreshStatus();
+    }
+
+    async function onRollback() {
+      const out = await api("/api/calibration/rollback", "POST");
+      setLog(out);
+      await refreshStatus();
+    }
+
+    async function onReset() {
+      const out = await api("/api/calibration/reset", "POST");
+      setLog(out);
+      await refreshStatus();
+    }
+
+    async function runAction(fn) {
+      try {
+        await fn();
+      } catch (err) {
+        setLog({ error: String(err) });
+      }
+    }
+
+    el("captureBtn").addEventListener("click", () => runAction(onCapture));
+    el("computeBtn").addEventListener("click", () => runAction(onCompute));
+    el("applyBtn").addEventListener("click", () => runAction(onApply));
+    el("rollbackBtn").addEventListener("click", () => runAction(onRollback));
+    el("resetBtn").addEventListener("click", () => runAction(onReset));
+    el("stopModeBtn").addEventListener("click", () => runAction(disableMode));
+    el("robotEnableBtn").addEventListener("click", () => runAction(enableRobot));
+    el("gravityEnableBtn").addEventListener("click", () => runAction(async () => {
+      const confirmed = window.confirm("开启重力补偿后机械臂可能下坠或被拖动，请确认机械臂处于安全姿态。");
+      if (!confirmed) return;
+      await setGravityCompensation(true);
+    }));
+    el("gravityDisableBtn").addEventListener("click", () => runAction(async () => {
+      await setGravityCompensation(false);
+    }));
+
+    window.addEventListener("beforeunload", () => {
+      const payload = new Blob([JSON.stringify({ active: false })], { type: "application/json" });
+      navigator.sendBeacon("/api/calibration/mode", payload);
+    });
+
+    (async () => {
+      await runAction(enableMode);
+      await refreshStatus();
+      await refreshRobotState();
+      setInterval(refreshStatus, 800);
+      setInterval(refreshRobotState, 1000);
+    })();
+  </script>
+</body>
+</html>
