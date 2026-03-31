@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dynamic_grasp.bridge import RobotBridge
+from dynamic_grasp.bridge import RobotBridge, _load_python_module, _resolve_nero_cli_module_path
 
 
 class _FakeSdkRobot:
@@ -98,6 +99,62 @@ class RobotBridgeTests(unittest.TestCase):
         transport = bridge.resolve_route_pose("threepoint.transport")
         legacy = bridge.resolve_route_pose("threepoint.dump_pre")
         self.assertEqual(transport, legacy)
+
+    def test_resolve_nero_cli_module_path_supports_unified_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            unified_cfg = root / "pipeline_config.yaml"
+            unified_cfg.write_text("dynamic_grasp: {}\n", encoding="utf-8")
+            expected = root / "robot_runtime" / "nero_test_cli.py"
+            expected.parent.mkdir(parents=True, exist_ok=True)
+            expected.write_text("# test cli\n", encoding="utf-8")
+
+            resolved = _resolve_nero_cli_module_path(unified_cfg)
+            self.assertEqual(resolved, expected.resolve())
+
+    def test_resolve_nero_cli_module_path_supports_legacy_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            legacy_cfg = root / "robot_runtime" / "config" / "default.yaml"
+            legacy_cfg.parent.mkdir(parents=True, exist_ok=True)
+            legacy_cfg.write_text("backend: real\n", encoding="utf-8")
+            expected = root / "robot_runtime" / "nero_test_cli.py"
+            expected.parent.mkdir(parents=True, exist_ok=True)
+            expected.write_text("# test cli\n", encoding="utf-8")
+
+            resolved = _resolve_nero_cli_module_path(legacy_cfg)
+            self.assertEqual(resolved, expected.resolve())
+
+    def test_load_python_module_registers_in_sys_modules_for_dataclass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            module_path = Path(tmpdir) / "dataclass_mod.py"
+            module_path.write_text(
+                "\n".join(
+                    [
+                        "from dataclasses import dataclass",
+                        "import sys",
+                        "MODULE_VISIBLE = (__name__ in sys.modules)",
+                        "@dataclass",
+                        "class Payload:",
+                        "    value: int = 1",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            module_name = "dynamic_grasp_bridge_dataclass_test"
+            previous = sys.modules.pop(module_name, None)
+            try:
+                module = _load_python_module(module_name, module_path)
+            finally:
+                if previous is not None:
+                    sys.modules[module_name] = previous
+                else:
+                    sys.modules.pop(module_name, None)
+
+            self.assertTrue(module.MODULE_VISIBLE)
+            self.assertEqual(module.Payload(3).value, 3)
 
 
 if __name__ == "__main__":

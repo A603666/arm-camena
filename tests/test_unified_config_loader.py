@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +52,25 @@ class UnifiedConfigLoaderTests(unittest.TestCase):
         self.assertIn("vision", dynamic_cfg)
         self.assertFalse(env_unified)
         self.assertEqual(env_map, {})
+
+    def test_unified_vision_env_rejects_legacy_flat_vision_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "pipeline_config.yaml"
+            cfg_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "vision_runtime": {
+                            "yolo_imgsz": 960,
+                            "infer_every_n": 3,
+                        }
+                    },
+                    sort_keys=False,
+                    allow_unicode=True,
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "deprecated flat keys"):
+                load_vision_env_map(cfg_path)
 
 
 if __name__ == "__main__":

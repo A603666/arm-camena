@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import logging
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 
@@ -77,12 +78,70 @@ class _PartialNeverFullRobot:
         return False
 
 
+class _SessionRobot:
+    def __init__(self) -> None:
+        self.connect_calls = 0
+        self.disconnect_calls = 0
+        self.set_normal_mode_calls = 0
+        self.reset_calls = 0
+
+    def connect(self) -> None:
+        self.connect_calls += 1
+
+    def disconnect(self) -> None:
+        self.disconnect_calls += 1
+
+    def set_normal_mode(self) -> None:
+        self.set_normal_mode_calls += 1
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+    def get_joints_enable_status_list(self):
+        return [False] * 7
+
+    def get_joint_angles(self):
+        return SimpleNamespace(msg=[0.0] * 7)
+
+    def enable(self) -> bool:
+        return False
+
+
 class AutoEnableDaemonEnableFlowTests(unittest.TestCase):
     def _run_with_fake_clock(self, fn):
         clock = _FakeClock()
         with mock.patch.object(daemon.time, "time", side_effect=clock.time):
             with mock.patch.object(daemon.time, "sleep", side_effect=clock.sleep):
                 return fn()
+
+    @staticmethod
+    def _fake_cfg() -> daemon.DaemonConfig:
+        return daemon.DaemonConfig(
+            can_channel="can1",
+            can_bitrate=1000000,
+            can_interface="socketcan",
+            usb_bus_info="1-2.1:1.0",
+            can_scripts_dir=Path("/tmp"),
+            retry_interval_sec=2.0,
+            enable_timeout_sec=1.0,
+            health_check_sec=1.0,
+        )
+
+    @staticmethod
+    def _make_fake_pyagxarm(robot: _SessionRobot) -> ModuleType:
+        fake_mod = ModuleType("pyAgxArm")
+
+        class _Factory:
+            @staticmethod
+            def create_arm(_cfg):
+                return robot
+
+        def _create_agx_arm_config(**kwargs):
+            return kwargs
+
+        fake_mod.AgxArmFactory = _Factory  # type: ignore[attr-defined]
+        fake_mod.create_agx_arm_config = _create_agx_arm_config  # type: ignore[attr-defined]
+        return fake_mod
 
     def test_delayed_enable_succeeds_with_progress_grace(self) -> None:
         robot = _DelayedEnableRobot()
@@ -127,6 +186,63 @@ class AutoEnableDaemonEnableFlowTests(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual(flags, [True, False, False, False, False, False, False])
         self.assertEqual(reason, "partial_enabled")
+
+    def test_establish_session_retries_with_reset_after_all_disabled(self) -> None:
+        cfg = self._fake_cfg()
+        robot = _SessionRobot()
+        logger = logging.getLogger("auto_enable_test_reset_success")
+        logger.handlers.clear()
+        logger.addHandler(logging.NullHandler())
+
+        with mock.patch.dict(sys.modules, {"pyAgxArm": self._make_fake_pyagxarm(robot)}):
+            with mock.patch.object(daemon, "find_can_iface_by_usb", return_value="can1"):
+                with mock.patch.object(daemon, "activate_can", return_value=True):
+                    with mock.patch.object(daemon, "wait_joint_ready", return_value=True):
+                        with mock.patch.object(
+                            daemon,
+                            "ensure_enabled",
+                            side_effect=[
+                                (False, [False] * 7, "all_disabled"),
+                                (True, [True] * 7, ""),
+                            ],
+                        ) as ensure_mock:
+                            ok, session_robot, reason = daemon.establish_robot_session(cfg, logger)
+
+        self.assertTrue(ok)
+        self.assertIs(session_robot, robot)
+        self.assertEqual(reason, "")
+        self.assertEqual(ensure_mock.call_count, 2)
+        self.assertEqual(robot.reset_calls, 1)
+        self.assertEqual(robot.set_normal_mode_calls, 2)
+        self.assertEqual(robot.disconnect_calls, 0)
+
+    def test_establish_session_fails_when_reset_retry_still_all_disabled(self) -> None:
+        cfg = self._fake_cfg()
+        robot = _SessionRobot()
+        logger = logging.getLogger("auto_enable_test_reset_fail")
+        logger.handlers.clear()
+        logger.addHandler(logging.NullHandler())
+
+        with mock.patch.dict(sys.modules, {"pyAgxArm": self._make_fake_pyagxarm(robot)}):
+            with mock.patch.object(daemon, "find_can_iface_by_usb", return_value="can1"):
+                with mock.patch.object(daemon, "activate_can", return_value=True):
+                    with mock.patch.object(daemon, "wait_joint_ready", return_value=True):
+                        with mock.patch.object(
+                            daemon,
+                            "ensure_enabled",
+                            side_effect=[
+                                (False, [False] * 7, "all_disabled"),
+                                (False, [False] * 7, "all_disabled"),
+                            ],
+                        ) as ensure_mock:
+                            ok, session_robot, reason = daemon.establish_robot_session(cfg, logger)
+
+        self.assertFalse(ok)
+        self.assertIsNone(session_robot)
+        self.assertEqual(reason, "joint enable timeout (all_disabled)")
+        self.assertEqual(ensure_mock.call_count, 2)
+        self.assertEqual(robot.reset_calls, 1)
+        self.assertEqual(robot.disconnect_calls, 1)
 
 
 if __name__ == "__main__":

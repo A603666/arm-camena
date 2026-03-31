@@ -1,10 +1,9 @@
-# Unified pipeline configuration for dynamic grasp + vision runtime + robot runtime.
-# Legacy configs remain supported for compatibility.
-
 dynamic_grasp:
   vision:
     base_url: http://127.0.0.1:18000
+    api_version: v2
     poll_hz: 12.0
+    min_axis_quality: 0.6
     health_timeout_sec: 2.0
     target_stable_frames: 3
     stable_pos_tol_mm: 5.0
@@ -12,150 +11,143 @@ dynamic_grasp:
     stable_yaw_tol_deg: 5.0
     plan_buffer_frames: 3
     max_replan_jump_mm: 25.0
-    min_quality_score: 0.50
+    min_quality_score: 0.5
     reject_on_quality_drop: true
-
   handeye:
-    mode: nominal
+    mode: calibrated
     extrinsics_path: ./模型文件/nero_description/config/handeye_extrinsics.yaml
-
   scan:
     max_offset_xy_m: 0.18
     max_step_xy_m: 0.03
     converge_tol_mm: 5.0
     lost_target_timeout_sec: 1.0
-
   grasp:
-    open_width_m: 0.05
-    close_width_m: 0.0
+    open_width_m: 0.10
+    close_width_m: 0.04
     force_n: 1.0
+    verify_enabled: false
     prepick_offset_m: 0.05
     final_z_offset_m: 0.0
-    max_descent_m: 0.35
-    min_safe_z_m: 0.10
+    max_descent_m: 1
+    min_safe_z_m: -0.4
     yaw_alignment_offset_deg: 0.0
-    verify_width_range_m: [0.003, 0.08]
+    verify_width_range_m:
+    - 0.003
+    - 0.08
     verify_timeout_sec: 1.5
-
   route:
     ready_from: threepoint.ready
     transport_from: threepoint.transport
     dump_from: threepoint.dump
-
   runtime:
-    # Point to this unified file so dynamic_grasp -> RobotBridge reads robot_runtime here.
     arm_config_path: ./pipeline_config.yaml
     speed_percent: 35
     move_timeout_sec: 30.0
     gripper_dwell_sec: 0.8
     log_dir: ./logs
-
 vision_runtime:
-  # If empty, start_vision_arm64.sh auto-selects *.engine then falls back to yolo26n.pt.
-  yolo_model: ""
-
-  # Stream/service endpoints
-  sub_endpoint: tcp://127.0.0.1:5557
-  sub_topic: frames.rgbd.v1
-  sub_timeout_ms: 120
-  pub_endpoint: tcp://127.0.0.1:5557
-  web_host: 0.0.0.0
-  web_port: 18000
-
-  # Publisher runtime
-  jpeg_quality: 85
-  wait_ms: 100
-  color_fps: 15
-  depth_fps: 30
-  align_mode: disable
-  frame_sync: false
-  ob_log_level: error
-
-  # Build/runtime switches
-  skip_build: true
-  force_rebuild: false
-
-  # Detector/runtime core
-  yolo_conf: 0.35
-  yolo_imgsz: 512
-  yolo_device: cuda:0
-  yolo_precision: fp32
-  yolo_warmup: true
-
-  # Geometry backend
-  geom_backend: cpu
-  geom_parity_check: false
-  geom_parity_every_n: 30
-  infer_every_n: 2
-  geometry_every_n: 1
-  geometry_force_recalc_iou: 0.75
-  center_depth_window: 5
-  min_depth_mm: 80.0
-  max_depth_mm: 5000.0
-  ransac_residual_mm: 12.0
-  ransac_max_trials: 120
-  ground_fit_fast_enabled: true
-  ground_fit_fast_sample_cap: 2500
-  ground_fit_fast_max_trials: 40
-  ground_fit_fast_min_inlier_ratio: 0.55
-  ground_fit_fast_min_inliers: 80
-  dbscan_eps_mm: 20.0
-  dbscan_min_samples: 30
-  min_object_points: 120
-  max_points_for_geometry: 12000
-  gripper_width_limit_mm: 100.0
-  grasp_window_len_mm: 80.0
-  grasp_window_step_mm: 5.0
-  grasp_window_min_points: 80
-  object_height_min_mm: 4.0
-  support_close_px: 5
-  axis_eig_ratio_min: 1.35
-  axis_hold_frames: 5
-  axis_smooth_alpha: 0.25
-
-  # Target lock and quality gates
-  target_lock_iou_min: 0.45
-  target_lock_hits: 2
-  target_lost_hold_frames: 6
-  target_max_center_jump_px: 80
-  target_max_depth_jump_mm: 80
-  support_switch_hold_frames: 3
-  depth_valid_ratio_min: 0.03
-  support_points_min: 180
-  support_fill_ratio_min: 0.02
-  ground_ratio_max: 0.96
-  quality_score_min: 0.50
-
-  # Temporal smoothing/anti-jump
-  grasp_point_smooth_alpha: 0.20
-  grasp_yaw_smooth_alpha: 0.20
-  grasp_hold_frames: 7
-  grasp_jump_xy_mm: 22
-  grasp_jump_z_mm: 22
-  grasp_jump_yaw_deg: 20
-
-  # Service logging/web control
-  annotated_jpeg_quality: 85
-  stale_frame_sec: 2.0
-  uvicorn_log_level: warning
-  uvicorn_access_log: false
-  robot_control_enabled: true
-  robot_loopback_only: true
-  robot_backend_override: ""
-
+  stream:
+    sub_endpoint: tcp://127.0.0.1:5557
+    sub_topic: frames.rgbd.v1
+    sub_timeout_ms: 120
+    pub_endpoint: tcp://127.0.0.1:5557
+  service:
+    web_host: 0.0.0.0
+    web_port: 18000
+    annotated_jpeg_quality: 85
+    stale_frame_sec: 2.0
+    uvicorn_log_level: warning
+    uvicorn_access_log: false
+  publisher:
+    jpeg_quality: 85
+    wait_ms: 100
+    color_fps: 15
+    depth_fps: 30
+    align_mode: auto
+    frame_sync: false
+    ob_log_level: error
+  build:
+    skip_build: true
+    force_rebuild: false
+  detector:
+    yolo_conf: 0.35
+    yolo_imgsz: 512
+    yolo_device: cuda:0
+    yolo_precision: fp32
+    yolo_warmup: true
+    infer_every_n: 2
+    yolo_model: ''
+  geometry:
+    geom_backend: cpu
+    geom_parity_check: false
+    geom_parity_every_n: 30
+    geometry_every_n: 1
+    geometry_force_recalc_iou: 0.75
+    center_depth_window: 5
+    min_depth_mm: 80.0
+    max_depth_mm: 5000.0
+    ransac_residual_mm: 12.0
+    ransac_max_trials: 120
+    ground_fit_fast_enabled: true
+    ground_fit_fast_sample_cap: 2500
+    ground_fit_fast_max_trials: 40
+    ground_fit_fast_min_inlier_ratio: 0.55
+    ground_fit_fast_min_inliers: 80
+    dbscan_eps_mm: 20.0
+    dbscan_min_samples: 30
+    min_object_points: 120
+    max_points_for_geometry: 12000
+    gripper_width_limit_mm: 100.0
+    grasp_window_len_mm: 80.0
+    grasp_window_step_mm: 5.0
+    grasp_window_min_points: 80
+  tracking:
+    target_lock_iou_min: 0.45
+    target_lock_hits: 2
+    target_lost_hold_frames: 6
+    target_max_center_jump_px: 80
+    target_max_depth_jump_mm: 80
+  segmentation:
+    object_height_min_mm: 4.0
+    support_close_px: 5
+    support_switch_hold_frames: 3
+    depth_valid_ratio_min: 0.03
+    support_points_min: 180
+    support_fill_ratio_min: 0.02
+    ground_ratio_max: 0.96
+    segmentation_debug_dbscan: false
+    seed_region_min_radius_px: 8
+    seed_region_max_radius_px: 140
+    seed_region_radius_step_px: 8
+  stability:
+    axis_eig_ratio_min: 1.35
+    axis_hold_frames: 5
+    axis_smooth_alpha: 0.25
+    quality_score_min: 0.5
+    grasp_point_smooth_alpha: 0.2
+    grasp_yaw_smooth_alpha: 0.2
+    grasp_hold_frames: 7
+    grasp_jump_xy_mm: 22
+    grasp_jump_z_mm: 22
+    grasp_jump_yaw_deg: 20
+  control:
+    robot_control_enabled: true
+    robot_loopback_only: true
+    robot_backend_override: ''
+  rollout:
+    vision_pipeline: v2
+    dynamic_grasp_api: v2
+    shadow_compare: false
+    metrics_window_size: 120
+    metrics_slow_frame_ms: 500.0
 robot_runtime:
   backend: real
-
-  # Real arm CAN connection (official pyAgxArm SDK)
   can_channel: can0
   can_interface: socketcan
   can_bitrate: 1000000
   pyagxarm_repo: ./vendor/pyAgxArm
-
   can_tools:
     scripts_dir: ./vendor/pyAgxArm/pyAgxArm/scripts/ubuntu
-
-  # Runtime
   waypoint_file: ./robot_runtime/config/waypoints.yaml
   move_timeout_sec: 30.0
   move_reach_tolerance_deg: 2.5
@@ -163,7 +155,6 @@ robot_runtime:
   move_min_progress_deg: 0.2
   move_reach_stable_cycles: 1
   final_step_confirm: true
-
   logging:
     enabled: true
     level: INFO
@@ -175,98 +166,140 @@ robot_runtime:
     capture_stderr: true
     log_commands: true
     feedback_csv_interval_sec: 5.0
-
-  # Motion safety
   speed_percent: 50
-  joint_limits_margin: 0.03
+  joint_limits_margin: 0.0
   jog_step_rad: 0.05
-
   safety:
     speed_percent_default: 10
     enforce_joint_limit_clamp: true
     warn_on_clamp: true
     max_joint_step_deg: 90
-
   joint_limits:
-    joint1: [-2.705261, 2.705261]
-    joint2: [-1.745330, 1.745330]
-    joint3: [-2.757621, 2.757621]
-    joint4: [-1.012291, 2.146755]
-    joint5: [-2.757621, 2.757621]
-    joint6: [-0.733039, 0.959932]
-    joint7: [-1.570797, 1.570797]
-
-  home_joints: [0.0, -0.6109, 1.0472, -0.9076, 0.0, 0.2793, 0.0]
-
+    joint1:
+    - -2.705261
+    - 2.705261
+    joint2:
+    - -1.74533
+    - 1.74533
+    joint3:
+    - -2.757621
+    - 2.757621
+    joint4:
+    - -1.012291
+    - 2.146755
+    joint5:
+    - -2.757621
+    - 2.757621
+    joint6:
+    - -0.733039
+    - 0.959932
+    joint7:
+    - -1.570797
+    - 1.570797
+  home_joints:
+  - 0.0
+  - -0.6109
+  - 1.0472
+  - -0.9076
+  - 0.0
+  - 0.2793
+  - 0.0
   gripper:
     type: agx_gripper
-    open_width: 0.05
-    close_width: 0.0
+    open_width: 0.10
+    close_width: 0.04
     force: 1.0
     dwell_sec: 0.8
-
   joint_test:
     delta_deg: 3.0
     dwell_sec: 0.3
-    joints: [j1, j2, j3, j4, j5, j6]
-
+    joints:
+    - j1
+    - j2
+    - j3
+    - j4
+    - j5
+    - j6
   threepoint:
     strict_down_enabled: false
     lock_orientation_from: pick
+    execution_profile: joint_first
     transfer_motion: p
     approach_motion: p
     orientation_tolerance_deg: 5.0
-    min_joint7_deg: -30
+    min_joint7_deg: 10.0
     overwrite_waypoints_on_start: true
-
     ready:
-      joints_deg: [-2.251, 15.042, -1.868, 102.229, -7.117, -0.513, 67.106]
+      joints_deg:
+      - 9.179
+      - 10.290
+      - -5.627
+      - 100.002
+      - -0.001
+      - 0.000
+      - 70.002
       pose_mm_deg:
-        x: -319.854
-        y: -2.171
-        z: 311.011
-        rx: -144.969
-        ry: -81.967
-        rz: -125.617
-
+        x: -307.027
+        y: -20.185
+        z: 174.635
+        rx: -166.267
+        ry: -88.966
+        rz: -100.092
     pick:
-      joints_deg: [-1.772, 40.412, -2.415, 94.858, 0.886, -2.980, 43.623]
+      joints_deg:
+      - 3.943
+      - 84.599
+      - -0.792
+      - 46.951
+      - 2.251
+      - 2.646
+      - 54.694
       pose_mm_deg:
-        x: -391.144
-        y: -0.064
-        z: 182.859
-        rx: 44.440
-        ry: -88.356
-        rz: 43.407
-
+        x: -490.641
+        y: -29.653
+        z: -185.828
+        rx: -97.847
+        ry: -83.695
+        rz: -171.804
     transport:
-      joints_deg: [85.984, 25.988, -9.499, 91.222, -5.931, -13.258, 64.938]
+      joints_deg:
+      - 93.469
+      - 6.697
+      - -5.667
+      - 99.769
+      - 0.187
+      - 0.021
+      - 70.579
       pose_mm_deg:
-        x: -47.083
-        y: -367.805
-        z: 293.499
-        rx: -132.860
-        ry: -85.280
-        rz: -45.304
-
+        x: -10.288
+        y: -303.900
+        z: 194.754
+        rx: 99.245
+        ry: -86.971
+        rz: 78.534
     dump:
-      joints_deg: [143.461, 24.089, 26.830, 96.045, 1.303, -7.086, 65.414]
+      joints_deg:
+      - 119.663
+      - -2.085
+      - 60.604
+      - 99.766
+      - -0.082
+      - 0.021
+      - 70.587
       pose_mm_deg:
-        x: 342.554
-        y: -78.702
-        z: 303.333
-        rx: -6.788
-        ry: -74.892
-        rz: -88.864
-
+        x: 293.713
+        y: 4.104
+        z: 234.899
+        rx: 100.160
+        ry: -79.163
+        rz: 170.261
   task:
     save_closed_state_waypoint: grip_closed_at_pick
-
 auto_enable:
   can_channel: can0
   can_bitrate: 1000000
   can_interface: socketcan
-  usb_bus_info: "1-2.4:1.0"
+  usb_bus_info: 1-2.2:1.0
   can_scripts_dir: ./vendor/pyAgxArm/pyAgxArm/scripts/ubuntu
   retry_interval_sec: 2.0
   enable_timeout_sec: 12.0

@@ -71,8 +71,8 @@ if [[ -z "${AUTO_ENABLE_CHANNEL}" || -z "${AUTO_ENABLE_USB_BUS_INFO}" ]]; then
     exit 2
 fi
 echo "[install] auto_enable channel=${AUTO_ENABLE_CHANNEL} usb_bus_info=${AUTO_ENABLE_USB_BUS_INFO}"
-if [[ "${AUTO_ENABLE_CHANNEL}" != "can0" ]]; then
-    echo "[install] invalid auto_enable.can_channel=${AUTO_ENABLE_CHANNEL}; this USB-CAN setup requires can0." >&2
+if [[ ! "${AUTO_ENABLE_CHANNEL}" =~ ^can[0-9]+$ ]]; then
+    echo "[install] invalid auto_enable.can_channel=${AUTO_ENABLE_CHANNEL}; expected format can<index> (e.g. can0/can1)." >&2
     exit 2
 fi
 

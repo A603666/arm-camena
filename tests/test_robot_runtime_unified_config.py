@@ -19,6 +19,12 @@ class RobotRuntimeUnifiedConfigTests(unittest.TestCase):
         self.assertIn("threepoint", cfg)
         self.assertIn("can_tools", cfg)
 
+    def test_unified_config_uses_safe_default_min_joint7_deg(self) -> None:
+        cfg = NeroArmTester._load_cfg((ROOT / "pipeline_config.yaml").resolve())
+        threepoint = cfg.get("threepoint", {})
+        self.assertIsInstance(threepoint, dict)
+        self.assertEqual(float(threepoint.get("min_joint7_deg")), 10.0)
+
 
 if __name__ == "__main__":
     unittest.main()

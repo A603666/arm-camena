@@ -92,6 +92,7 @@ class RobotRuntimePrepickTests(unittest.TestCase):
         tester.strict_down_enabled = False
         tester.transfer_motion = "p"
         tester.approach_motion = "p"
+        tester.execution_profile = "pose_only"
         tester.in_step_prompt = False
         tester.cfg = {
             "gripper": {"open_width": 0.05, "close_width": 0.0, "force": 1.0},
@@ -113,6 +114,71 @@ class RobotRuntimePrepickTests(unittest.TestCase):
         self.assertEqual(events[2], ("move", "prepick", "p"))
         self.assertEqual(events[3], ("move", "pick", "l"))
         self.assertEqual(events[4], ("close", 0.0, 1.0))
+
+    def test_threepoint_joint_first_uses_joint_segments_for_long_transfers(self) -> None:
+        events: list[tuple] = []
+
+        tester = NeroArmTester.__new__(NeroArmTester)
+        tester.logger = logging.getLogger(f"threepoint_joint_first_{id(events)}")
+        tester.logger.handlers.clear()
+        tester.logger.addHandler(logging.NullHandler())
+        tester.strict_down_enabled = False
+        tester.transfer_motion = "p"
+        tester.approach_motion = "p"
+        tester.execution_profile = "joint_first"
+        tester.in_step_prompt = False
+        tester.cfg = {
+            "gripper": {"open_width": 0.05, "close_width": 0.0, "force": 1.0},
+            "task": {"save_closed_state_waypoint": "grip_closed_at_pick"},
+        }
+        tester.backend = _BackendStub(events)
+        tester.threepoint_info = {
+            name: {
+                "pose_m_rad": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "locked_pose_m_rad": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "joints_rad": [0.0] * 7,
+            }
+            for name in THREEPOINT_EXEC_ROUTE
+        }
+        tester._move_threepoint_joints = lambda name, label: events.append(("joint", name)) or True  # type: ignore[method-assign]
+        tester._move_threepoint_pose = lambda name, label, motion: events.append(("pose", name, motion)) or True  # type: ignore[method-assign]
+        tester._save_runtime_state = lambda name: events.append(("save", name)) or True  # type: ignore[method-assign]
+
+        ok = NeroArmTester._run_threepoint_sequence(tester, step_mode=False)
+        self.assertTrue(ok)
+
+        self.assertEqual(events[0], ("joint", "ready"))
+        self.assertEqual(events[2], ("pose", "prepick", "p"))
+        self.assertEqual(events[3], ("pose", "pick", "l"))
+        self.assertIn(("joint", "transport"), events)
+        self.assertIn(("joint", "dump"), events)
+
+    def test_pick_fallback_logs_override_context(self) -> None:
+        tester = NeroArmTester.__new__(NeroArmTester)
+
+        class _LoggerStub:
+            def __init__(self) -> None:
+                self.warnings: list[str] = []
+
+            def warning(self, msg: str, *args) -> None:
+                if args:
+                    self.warnings.append(msg % args)
+                else:
+                    self.warnings.append(msg)
+
+        tester.logger = _LoggerStub()
+        tester._move_threepoint_pose = lambda name, label, motion: False  # type: ignore[method-assign]
+        tester._move_threepoint_joints = lambda name, label: True  # type: ignore[method-assign]
+        tester._web_override_context = {
+            "active": True,
+            "override_pick_vs_static_pick_delta": [0.01, -0.02, 0.03, 0.1, -0.2, 0.3],
+        }
+
+        ok = NeroArmTester._move_pick_vertical_with_fallback(tester)
+        self.assertTrue(ok)
+        self.assertTrue(tester.logger.warnings)
+        self.assertIn("override_active=true", tester.logger.warnings[0])
+        self.assertIn("override_pick_vs_static_pick_delta=", tester.logger.warnings[0])
 
 
 if __name__ == "__main__":

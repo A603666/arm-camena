@@ -145,8 +145,16 @@ class HandEyeModel:
             raise ValueError("hand-eye config is missing nominal_camera or gripper_nominal")
 
         selected_mode = str(mode).strip().lower() or "nominal"
+        if selected_mode not in {"nominal", "calibrated"}:
+            selected_mode = "nominal"
+
         camera_source = nominal
-        if selected_mode == "calibrated" and isinstance(calibrated, dict) and bool(calibrated.get("enabled", False)):
+        if selected_mode == "calibrated":
+            if not isinstance(calibrated, dict) or not bool(calibrated.get("enabled", False)):
+                raise ValueError(
+                    "calibrated hand-eye is required but unavailable "
+                    "(expect calibrated_camera.enabled=true in handeye_extrinsics.yaml)"
+                )
             camera_source = calibrated
 
         flange_to_camera_pose = tuple(

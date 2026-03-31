@@ -1,5 +1,6 @@
 vision:
   base_url: http://127.0.0.1:18000
+  api_version: v2
   poll_hz: 12.0
   health_timeout_sec: 2.0
   target_stable_frames: 3
@@ -8,11 +9,11 @@ vision:
   stable_yaw_tol_deg: 5.0
   plan_buffer_frames: 3
   max_replan_jump_mm: 25.0
-  min_quality_score: 0.50
+  min_quality_score: 0.40
   reject_on_quality_drop: true
 
 handeye:
-  mode: nominal
+  mode: calibrated
   extrinsics_path: ./模型文件/nero_description/config/handeye_extrinsics.yaml
 
 scan:
@@ -22,9 +23,10 @@ scan:
   lost_target_timeout_sec: 1.0
 
 grasp:
-  open_width_m: 0.05
-  close_width_m: 0.0
+  open_width_m: 0.10
+  close_width_m: 0.04
   force_n: 1.0
+  verify_enabled: false
   prepick_offset_m: 0.05
   final_z_offset_m: 0.0
   max_descent_m: 0.35

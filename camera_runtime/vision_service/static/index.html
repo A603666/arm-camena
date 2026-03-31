@@ -353,6 +353,10 @@
           <div class="k">窗口进度</div><div id="dynamicWindow" class="v">0/18</div>
           <div class="k">稳定判定</div><div id="dynamicStableState" class="v">未稳定</div>
           <div class="k">稳定点位</div><div id="dynamicStablePoint" class="v">-</div>
+          <div class="k">手眼来源</div><div id="dynamicHandeyeSource" class="v">-</div>
+          <div class="k">手眼状态</div><div id="dynamicHandeyeState" class="v">-</div>
+          <div class="k">当前阈值</div><div id="dynamicThresholds" class="v">-</div>
+          <div class="k">失败原因计数</div><div id="dynamicFailCounts" class="v">-</div>
         </div>
         <div class="form-grid">
           <div class="field"><label for="dynamicCloseWidth">关夹爪宽度(m)</label><input id="dynamicCloseWidth" type="number" step="0.001" min="0" value="0" /></div>
@@ -386,6 +390,19 @@
       window: [],
       stableSnapshot: null,
       latestReason: "未启动",
+      reasonCounts: {},
+      reasonLabels: {},
+    };
+
+    const DEFAULT_DYNAMIC_CONFIG = {
+      window: 18,
+      min_axis_quality: 0.85,
+      mad_limit: { x: 1.5, y: 1.5, z: 2.0, yaw: 1.2 },
+    };
+    let dynamicConfig = {
+      window: DEFAULT_DYNAMIC_CONFIG.window,
+      min_axis_quality: DEFAULT_DYNAMIC_CONFIG.min_axis_quality,
+      mad_limit: { ...DEFAULT_DYNAMIC_CONFIG.mad_limit },
     };
 
     const GRAVITY_INTERLOCKED_COMMANDS = new Set([
@@ -395,9 +412,29 @@
       "run_threepoint_step_next",
     ]);
 
-    const DYNAMIC_WINDOW = 18;
-    const DYNAMIC_MIN_AXIS_QUALITY = 0.85;
-    const DYNAMIC_MAD_LIMIT = { x: 1.5, y: 1.5, z: 2.0, yaw: 1.2 };
+    function normalizeDynamicConfig(raw) {
+      const source = (raw && typeof raw === "object") ? raw : {};
+      const madRaw = (source.mad_limit && typeof source.mad_limit === "object") ? source.mad_limit : {};
+      const asFinite = (value, fallback) => {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : Number(fallback);
+      };
+      const window = Math.max(3, Math.min(120, Math.round(asFinite(source.window, DEFAULT_DYNAMIC_CONFIG.window))));
+      const minAxisQuality = Math.max(0, Math.min(1, asFinite(source.min_axis_quality, DEFAULT_DYNAMIC_CONFIG.min_axis_quality)));
+      const mad = {
+        x: Math.max(0.1, asFinite(madRaw.x, DEFAULT_DYNAMIC_CONFIG.mad_limit.x)),
+        y: Math.max(0.1, asFinite(madRaw.y, DEFAULT_DYNAMIC_CONFIG.mad_limit.y)),
+        z: Math.max(0.1, asFinite(madRaw.z, DEFAULT_DYNAMIC_CONFIG.mad_limit.z)),
+        yaw: Math.max(0.1, asFinite(madRaw.yaw, DEFAULT_DYNAMIC_CONFIG.mad_limit.yaw)),
+      };
+      return { window, min_axis_quality: minAxisQuality, mad_limit: mad };
+    }
+
+    function recordDynamicFailure(reasonCode, reasonLabel) {
+      const key = String(reasonCode || "unknown");
+      dynamicState.reasonCounts[key] = Number(dynamicState.reasonCounts[key] || 0) + 1;
+      dynamicState.reasonLabels[key] = String(reasonLabel || key);
+    }
 
     function fmt(n, digits = 2) {
       if (n === null || n === undefined || Number.isNaN(n)) return "-";
@@ -485,6 +522,7 @@
     function setAuxControlsDisabled() {
       const enabled = !!robotStateCache?.enabled;
       const busy = !!robotStateCache?.busy;
+      const handeyeBlocked = robotStateCache?.handeye_ready === false;
 
       el("applySpeedBtn").disabled = !enabled || busy;
       el("applyRandomBtn").disabled = !enabled || busy;
@@ -493,7 +531,7 @@
 
       el("dynamicStartBtn").disabled = !enabled || busy || dynamicState.active;
       el("dynamicStopBtn").disabled = !enabled || busy || !dynamicState.active;
-      el("dynamicSaveBtn").disabled = !enabled || busy || !dynamicState.active || !dynamicState.stableSnapshot;
+      el("dynamicSaveBtn").disabled = !enabled || busy || !dynamicState.active || !dynamicState.stableSnapshot || handeyeBlocked;
     }
 
     function setRobotBadge(text, cls) {
@@ -559,6 +597,10 @@
 
     function renderRobotState(data) {
       robotStateCache = data ?? null;
+      dynamicConfig = normalizeDynamicConfig(data?.dynamic_stability_config);
+      if (dynamicState.window.length > dynamicConfig.window) {
+        dynamicState.window = dynamicState.window.slice(dynamicState.window.length - dynamicConfig.window);
+      }
 
       const enabled = !!data?.enabled;
       const connected = !!data?.connected;
@@ -731,13 +773,16 @@
         dynamicState.window = [sample];
       } else {
         dynamicState.window.push(sample);
-        if (dynamicState.window.length > DYNAMIC_WINDOW) {
-          dynamicState.window = dynamicState.window.slice(dynamicState.window.length - DYNAMIC_WINDOW);
+        if (dynamicState.window.length > dynamicConfig.window) {
+          dynamicState.window = dynamicState.window.slice(dynamicState.window.length - dynamicConfig.window);
         }
       }
 
       const stats = evaluateDynamicWindow(dynamicState.window);
       dynamicState.latestReason = stats.reason;
+      if (!stats.stable) {
+        recordDynamicFailure(stats.reason_code, stats.reason);
+      }
 
       if (stats.stable) {
         dynamicState.stableSnapshot = {
@@ -789,13 +834,17 @@
     }
 
     function evaluateDynamicWindow(windowSamples) {
-      if (!windowSamples || windowSamples.length < DYNAMIC_WINDOW) {
-        return { stable: false, reason: `窗口未满 ${windowSamples.length}/${DYNAMIC_WINDOW}` };
+      if (!windowSamples || windowSamples.length < dynamicConfig.window) {
+        return {
+          stable: false,
+          reason_code: "window_not_full",
+          reason: `窗口未满 ${windowSamples.length}/${dynamicConfig.window}`,
+        };
       }
 
       const className = windowSamples[0].className;
       if (!windowSamples.every((item) => item.className === className)) {
-        return { stable: false, reason: "类别不一致" };
+        return { stable: false, reason_code: "class_mismatch", reason: "类别不一致" };
       }
 
       const xs = windowSamples.map((s) => s.x);
@@ -818,27 +867,28 @@
       const zMad = mad(zs, zMedian);
       const yawMad = mad(yawsWrapped, yawMedianWrapped);
 
-      if (axisQualityMedian == null || axisQualityMedian < DYNAMIC_MIN_AXIS_QUALITY) {
-        return { stable: false, reason: `axis_quality中位数不足(${fmt(axisQualityMedian, 3)})` };
+      if (axisQualityMedian == null || axisQualityMedian < dynamicConfig.min_axis_quality) {
+        return { stable: false, reason_code: "axis_quality_low", reason: `axis_quality中位数不足(${fmt(axisQualityMedian, 3)})` };
       }
-      if (xMad == null || xMad > DYNAMIC_MAD_LIMIT.x) {
-        return { stable: false, reason: `X MAD超限(${fmt(xMad, 2)}mm)` };
+      if (xMad == null || xMad > dynamicConfig.mad_limit.x) {
+        return { stable: false, reason_code: "x_mad_high", reason: `X MAD超限(${fmt(xMad, 2)}mm)` };
       }
-      if (yMad == null || yMad > DYNAMIC_MAD_LIMIT.y) {
-        return { stable: false, reason: `Y MAD超限(${fmt(yMad, 2)}mm)` };
+      if (yMad == null || yMad > dynamicConfig.mad_limit.y) {
+        return { stable: false, reason_code: "y_mad_high", reason: `Y MAD超限(${fmt(yMad, 2)}mm)` };
       }
-      if (zMad == null || zMad > DYNAMIC_MAD_LIMIT.z) {
-        return { stable: false, reason: `Z MAD超限(${fmt(zMad, 2)}mm)` };
+      if (zMad == null || zMad > dynamicConfig.mad_limit.z) {
+        return { stable: false, reason_code: "z_mad_high", reason: `Z MAD超限(${fmt(zMad, 2)}mm)` };
       }
-      if (yawMad == null || yawMad > DYNAMIC_MAD_LIMIT.yaw) {
-        return { stable: false, reason: `Yaw MAD超限(${fmt(yawMad, 2)}deg)` };
+      if (yawMad == null || yawMad > dynamicConfig.mad_limit.yaw) {
+        return { stable: false, reason_code: "yaw_mad_high", reason: `Yaw MAD超限(${fmt(yawMad, 2)}deg)` };
       }
       if (!!robotStateCache?.busy) {
-        return { stable: false, reason: "机械臂执行中，暂不允许保存" };
+        return { stable: false, reason_code: "robot_busy", reason: "机械臂执行中，暂不允许保存" };
       }
 
       return {
         stable: true,
+        reason_code: "stable",
         reason: "稳定可保存",
         className,
         xMedian,
@@ -861,13 +911,37 @@
       const liveGrasp = data?.grasp
         ? `${fmt(data.grasp.x_mm, 1)}, ${fmt(data.grasp.y_mm, 1)}, ${fmt(data.grasp.z_mm, 1)} / yaw=${fmt(data.grasp.yaw_deg, 1)}`
         : "-";
+      const handeyeSource = robotStateCache?.handeye_source_effective ?? "-";
+      const handeyeReady = robotStateCache?.handeye_ready;
+      const handeyeError = robotStateCache?.handeye_error;
 
       el("dynamicModeState").textContent = dynamicState.active ? "运行中" : "未启动";
       el("dynamicModeState").className = "v " + (dynamicState.active ? "warn" : "ok");
       el("dynamicLiveClass").textContent = liveClass;
       el("dynamicLiveConf").textContent = liveConf;
       el("dynamicLiveGrasp").textContent = liveGrasp;
-      el("dynamicWindow").textContent = `${dynamicState.window.length}/${DYNAMIC_WINDOW}`;
+      el("dynamicWindow").textContent = `${dynamicState.window.length}/${dynamicConfig.window}`;
+      el("dynamicHandeyeSource").textContent = String(handeyeSource);
+      if (handeyeReady === false) {
+        el("dynamicHandeyeState").textContent = handeyeError ? `不可用 (${handeyeError})` : "不可用";
+        el("dynamicHandeyeState").className = "v danger";
+      } else if (handeyeReady === true) {
+        el("dynamicHandeyeState").textContent = "可用";
+        el("dynamicHandeyeState").className = "v ok";
+      } else {
+        el("dynamicHandeyeState").textContent = "-";
+        el("dynamicHandeyeState").className = "v";
+      }
+      el("dynamicThresholds").textContent =
+        `window=${dynamicConfig.window}, axis>=${fmt(dynamicConfig.min_axis_quality, 2)}, `
+        + `MAD[x/y/z/yaw]=${fmt(dynamicConfig.mad_limit.x, 1)}/${fmt(dynamicConfig.mad_limit.y, 1)}/`
+        + `${fmt(dynamicConfig.mad_limit.z, 1)}/${fmt(dynamicConfig.mad_limit.yaw, 1)}`;
+
+      const failEntries = Object.entries(dynamicState.reasonCounts)
+        .sort((lhs, rhs) => Number(rhs[1]) - Number(lhs[1]))
+        .slice(0, 5)
+        .map(([key, count]) => `${dynamicState.reasonLabels[key] || key}:${count}`);
+      el("dynamicFailCounts").textContent = failEntries.length > 0 ? failEntries.join(" | ") : "-";
 
       if (dynamicState.stableSnapshot) {
         const s = dynamicState.stableSnapshot;
@@ -957,6 +1031,8 @@
         dynamicState.window = [];
         dynamicState.stableSnapshot = null;
         dynamicState.latestReason = "等待稳定窗口";
+        dynamicState.reasonCounts = {};
+        dynamicState.reasonLabels = {};
         renderDynamicPanel();
       });
 
@@ -965,6 +1041,8 @@
         dynamicState.window = [];
         dynamicState.stableSnapshot = null;
         dynamicState.latestReason = "已停止";
+        dynamicState.reasonCounts = {};
+        dynamicState.reasonLabels = {};
         renderDynamicPanel();
       });
 

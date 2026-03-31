@@ -18,6 +18,39 @@ def test_bbox_iou_for_disjoint_boxes() -> None:
     assert iou == 0.0
 
 
+def test_map_uv_between_frames_respects_center_and_bounds() -> None:
+    mapped_center = VisionProcessor._map_uv_between_frames(
+        u=320,
+        v=240,
+        src_width=640,
+        src_height=480,
+        dst_width=640,
+        dst_height=400,
+    )
+    assert mapped_center == (320, 200)
+
+    mapped_corner = VisionProcessor._map_uv_between_frames(
+        u=639,
+        v=479,
+        src_width=640,
+        src_height=480,
+        dst_width=640,
+        dst_height=400,
+    )
+    assert mapped_corner == (639, 399)
+
+
+def test_map_bbox_between_frames_scales_to_depth_space() -> None:
+    mapped = VisionProcessor._map_bbox_between_frames(
+        bbox=[267, 206, 357, 468],
+        src_width=640,
+        src_height=480,
+        dst_width=640,
+        dst_height=400,
+    )
+    assert mapped == (267, 172, 357, 390)
+
+
 def test_should_run_geometry_respects_every_n_and_iou() -> None:
     processor = object.__new__(VisionProcessor)
     processor._cfg = SimpleNamespace(geometry_every_n=2, geometry_force_recalc_iou=0.75)
@@ -448,3 +481,73 @@ def test_evaluate_geometry_quality_rejects_low_quality_frames() -> None:
     assert ok_good is True
     assert score_good >= 0.5
     assert flags_good == []
+
+
+def test_finalize_packet_output_v1_with_shadow_compare_adds_summary() -> None:
+    processor = object.__new__(VisionProcessor)
+    processor._cfg = SimpleNamespace(
+        vision_pipeline="v1",
+        shadow_compare=True,
+        metrics_window_size=10,
+        metrics_slow_frame_ms=500.0,
+    )
+    processor._encode_annotated = lambda _img: b"jpeg"
+
+    result = {
+        "status": "no_target",
+        "target": None,
+        "depth": {"center_depth_mm": 1000.0},
+        "size": None,
+        "grasp": None,
+        "segmentation": None,
+        "timing": {"infer_ms": 3.0, "geometry_total_ms": 1.0},
+    }
+
+    output, encoded = processor._finalize_packet_output(result, np.zeros((8, 8, 3), dtype=np.uint8))
+    assert encoded == b"jpeg"
+    assert output["status"] == "no_target"
+    shadow = output.get("shadow_compare")
+    assert isinstance(shadow, dict)
+    assert shadow.get("enabled") is True
+    assert shadow.get("primary_pipeline") == "v1"
+    assert shadow.get("v1", {}).get("status") == "no_target"
+    assert shadow.get("v2", {}).get("status") == "lost"
+
+
+def test_finalize_packet_output_v2_with_shadow_compare_adds_summary() -> None:
+    processor = object.__new__(VisionProcessor)
+    processor._cfg = SimpleNamespace(
+        vision_pipeline="v2",
+        shadow_compare=True,
+        metrics_window_size=10,
+        metrics_slow_frame_ms=500.0,
+    )
+    processor._encode_annotated = lambda _img: b"jpeg"
+
+    result = {
+        "status": "ok",
+        "target": {
+            "class_id": 0,
+            "class_name": "box",
+            "conf": 0.9,
+            "bbox_xyxy": [10, 20, 30, 40],
+            "tracker_state": "locked",
+            "tracker_score": 0.88,
+            "rejected_reason": None,
+        },
+        "depth": {"target_center_depth_mm": 900.0},
+        "size": {"width_mm": 40.0},
+        "grasp": {"x_mm": 1.0, "y_mm": 2.0, "z_mm": 3.0, "axis_dir_cam": [1.0, 0.0, 0.0]},
+        "segmentation": {"quality_score": 0.8, "quality_flags": []},
+        "timing": {"infer_ms": 4.0, "geometry_total_ms": 2.0},
+    }
+
+    output, encoded = processor._finalize_packet_output(result, np.zeros((8, 8, 3), dtype=np.uint8))
+    assert encoded == b"jpeg"
+    assert output["schema_version"] == 2
+    assert output["status"] == "ok"
+    shadow = output.get("shadow_compare")
+    assert isinstance(shadow, dict)
+    assert shadow.get("primary_pipeline") == "v2"
+    assert shadow.get("status_match") is True
+    assert shadow.get("v2", {}).get("tracking", {}).get("state") == "locked"

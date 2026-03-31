@@ -52,6 +52,8 @@ class DynamicGraspController:
         self._min_joint7_deg = min_joint7_deg
         self._min_joint7_rad = math.radians(min_joint7_deg)
         self.ready_tcp_pose: list[float] | None = None
+        self._last_phase: str = "idle"
+        self._last_failure_code: str | None = None
 
     def shutdown(self) -> None:
         self.robot.shutdown()
@@ -512,7 +514,9 @@ class DynamicGraspController:
         if current_tcp is not None and self.ready_tcp_pose is not None and current_tcp[2] < self.ready_tcp_pose[2] - 1e-6:
             lift_tcp = list(current_tcp)
             lift_tcp[2] = float(self.ready_tcp_pose[2])
-            self.robot.move_tcp_l(lift_tcp)
+            if not self.robot.move_tcp_l(lift_tcp):
+                self.logger.error("recover to ready failed: linear lift failed")
+                return False
         return self._move_ready(reason)
 
     def _move_dump_route(self) -> bool:
@@ -532,39 +536,49 @@ class DynamicGraspController:
             return False
         return self._move_ready("dump complete")
 
+    def _enter_phase(self, name: str) -> None:
+        self._last_phase = str(name)
+        self.logger.info("phase=%s", self._last_phase)
+
+    def _fail_phase(self, failure_code: str, *, recover_reason: str | None = None, recover: bool = True) -> bool:
+        self._last_failure_code = str(failure_code)
+        self.logger.warning("phase failed: %s (phase=%s)", self._last_failure_code, self._last_phase)
+        if recover:
+            self._recover_to_ready(recover_reason or self._last_failure_code)
+        return False
+
     def execute_cycle(self, initial_snapshot: VisionSnapshot) -> bool:
         self.logger.info("dynamic grasp cycle start")
+        self._last_failure_code = None
+        plan: TargetPlan | None = None
+        aligned_snapshot: VisionSnapshot | None = None
 
+        self._enter_phase("scan")
         self._prompt("Move ready and open gripper")
         if not self._move_ready("cycle start"):
-            return False
+            return self._fail_phase("scan_ready_move_failed", recover=False)
         if not self._gripper_open():
-            return False
-
-        self._prompt("Start scan phase")
+            return self._fail_phase("scan_gripper_open_failed", recover=False)
         centered_snapshot = self._scan_to_center(initial_snapshot)
         if centered_snapshot is None:
-            self._recover_to_ready("scan phase failed")
-            return False
+            return self._fail_phase("scan_target_center_failed", recover_reason="scan phase failed")
 
+        self._enter_phase("align")
         aligned_snapshot = self._align_yaw(centered_snapshot)
         if aligned_snapshot is None:
-            self._recover_to_ready("yaw align failed")
-            return False
+            return self._fail_phase("align_yaw_failed", recover_reason="yaw align failed")
 
+        self._enter_phase("prepick")
         self._prompt("Start prepick phase")
         plan = self._build_buffered_target_plan(aligned_snapshot)
         if plan is None:
-            self._recover_to_ready("invalid prepick/pick plan")
-            return False
-
+            return self._fail_phase("prepick_plan_invalid", recover_reason="invalid prepick/pick plan")
         if not self.robot.move_tcp_p(plan.prepick_tcp_pose):
-            self._recover_to_ready("prepick move failed")
-            return False
+            return self._fail_phase("prepick_move_failed", recover_reason="prepick move failed")
         if not self._joint7_is_safe("prepick move"):
-            self._recover_to_ready("prepick move failed J7 check")
-            return False
+            return self._fail_phase("prepick_joint7_unsafe", recover_reason="prepick move failed J7 check")
 
+        self._enter_phase("descend")
         refreshed_ok = False
         replan_attempts = max(2, int(self.config.vision.plan_buffer_frames) + 1)
         for attempt in range(replan_attempts):
@@ -586,41 +600,39 @@ class DynamicGraspController:
             refreshed_ok = True
             break
         if not refreshed_ok:
-            self._recover_to_ready("target unstable before pick descend")
-            return False
-
+            return self._fail_phase("descend_replan_unstable", recover_reason="target unstable before pick descend")
         if not self.robot.move_tcp_l(plan.pick_tcp_pose):
-            self._recover_to_ready("pick descend failed")
-            return False
+            return self._fail_phase("descend_pick_move_failed", recover_reason="pick descend failed")
         if not self._joint7_is_safe("pick descend"):
-            self._recover_to_ready("pick descend failed J7 check")
-            return False
+            return self._fail_phase("descend_joint7_unsafe", recover_reason="pick descend failed J7 check")
 
+        self._enter_phase("verify")
         self._prompt("Close gripper")
         if not self._gripper_close():
             self._gripper_open()
-            self._recover_to_ready("close gripper failed")
-            return False
+            return self._fail_phase("verify_gripper_close_failed", recover_reason="close gripper failed")
+        # NOTE: verification can be unreliable after descend when camera alignment is weak.
+        # Default behavior now skips active verification unless explicitly enabled.
+        if bool(self.config.grasp.verify_enabled):
+            if not self._verify_grasp():
+                self._gripper_open()
+                return self._fail_phase("verify_grasp_failed", recover_reason="grasp verification failed")
+        else:
+            self.logger.info("grasp verification skipped (grasp.verify_enabled=false)")
 
-        if not self._verify_grasp():
-            self._gripper_open()
-            self._recover_to_ready("grasp verification failed")
-            return False
-
+        self._enter_phase("recover")
         if not self.robot.move_tcp_l(plan.prepick_tcp_pose):
-            self._recover_to_ready("lift to prepick failed")
-            return False
+            return self._fail_phase("recover_lift_prepick_failed", recover_reason="lift to prepick failed")
         if not self._joint7_is_safe("lift to prepick"):
-            self._recover_to_ready("lift to prepick failed J7 check")
-            return False
-
+            return self._fail_phase("recover_joint7_unsafe", recover_reason="lift to prepick failed J7 check")
         if not self._move_ready("post-grasp ready"):
-            return False
+            return self._fail_phase("recover_ready_failed", recover=False)
 
         self._prompt("Enter recovery route")
         if not self._move_dump_route():
-            return False
+            return self._fail_phase("recover_dump_route_failed", recover=False)
 
+        self._enter_phase("done")
         self.logger.info("dynamic grasp cycle completed")
         return True
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from dataclasses import replace
@@ -64,16 +65,54 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = load_app_config(args.config)
+    api_version_override = os.getenv("DABAI_DYNAMIC_GRASP_API", "").strip().lower()
+    if api_version_override:
+        if api_version_override != "v2":
+            print(f"invalid DABAI_DYNAMIC_GRASP_API={api_version_override!r}, only 'v2' is supported", file=sys.stderr)
+            return 2
+        config = replace(config, vision=replace(config.vision, api_version=api_version_override))
     if args.vision_url:
         config = replace(config, vision=replace(config.vision, base_url=str(args.vision_url).rstrip("/")))
 
     logger, log_path = setup_logger(config)
     print(f"log_file={log_path}")
-    logger.info("loaded config=%s mode=%s once=%s vision_url=%s", config.config_path, args.mode, args.once, config.vision.base_url)
+    logger.info(
+        "loaded config=%s mode=%s once=%s vision_url=%s api_version=%s",
+        config.config_path,
+        args.mode,
+        args.once,
+        config.vision.base_url,
+        config.vision.api_version,
+    )
+    logger.info(
+        "handeye requested_mode=%s extrinsics_path=%s",
+        config.handeye.mode,
+        config.handeye.extrinsics_path,
+    )
+    try:
+        handeye = HandEyeModel.from_yaml(config.handeye.extrinsics_path, mode=config.handeye.mode)
+    except Exception as exc:
+        logger.error(
+            "handeye initialization failed requested_mode=%s extrinsics_path=%s error=%s",
+            config.handeye.mode,
+            config.handeye.extrinsics_path,
+            exc,
+        )
+        return 2
+    effective_source = "calibrated" if handeye.mode == "calibrated" else "nominal"
+    logger.info(
+        "handeye effective_source=%s requested_mode=%s extrinsics_path=%s",
+        effective_source,
+        config.handeye.mode,
+        config.handeye.extrinsics_path,
+    )
 
-    handeye = HandEyeModel.from_yaml(config.handeye.extrinsics_path, mode=config.handeye.mode)
     robot = RobotBridge(config.runtime.arm_config_path, config.runtime.move_timeout_sec, logger)
-    vision = VisionClient(config.vision.base_url, timeout_sec=config.vision.health_timeout_sec)
+    vision = VisionClient(
+        config.vision.base_url,
+        timeout_sec=config.vision.health_timeout_sec,
+        api_version=config.vision.api_version,
+    )
     controller = DynamicGraspController(
         config=config,
         robot=robot,

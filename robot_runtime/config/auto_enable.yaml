@@ -9,8 +9,8 @@ can_interface: socketcan
 
 # Required: bind to a fixed USB-CAN port to avoid wrong-device activation.
 # Example: "1-2:1.0"
-# USB candleLight on this machine is currently at 1-2.4:1.0.
-usb_bus_info: "1-2.4:1.0"
+# USB candleLight on this machine is currently at 1-2.2:1.0.
+usb_bus_info: "1-2.2:1.0"
 
 can_scripts_dir: ../../vendor/pyAgxArm/pyAgxArm/scripts/ubuntu
 

@@ -62,6 +62,8 @@ def build_robot_router(manager: RobotControlManager, enabled: bool, loopback_onl
             raise HTTPException(status_code=400, detail=message or "invalid params")
         if not ok and error_code == "gravity_interlock":
             raise HTTPException(status_code=409, detail=message or "gravity compensation interlock active")
+        if not ok and error_code == "daemon_conflict":
+            raise HTTPException(status_code=409, detail=message or "robot daemon conflict active")
         if not ok and message == "robot is busy":
             raise HTTPException(status_code=409, detail=message)
         if not ok and message == "robot web control disabled":

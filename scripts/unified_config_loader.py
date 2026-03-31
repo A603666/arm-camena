@@ -129,97 +129,142 @@ def load_vision_env_map(config_path: str | Path) -> tuple[dict[str, str], bool]:
 
     section = _require_mapping(raw.get("vision_runtime"), "vision_runtime")
 
+    def _read_path_value(key_path: str) -> Any:
+        # v2 grouped layout only: detector/tracking/segmentation/geometry/stability/rollout/stream/service/...
+        cur: Any = section
+        for part in key_path.split("."):
+            if not isinstance(cur, dict):
+                return None
+            if part not in cur:
+                return None
+            cur = cur.get(part)
+        return cur
+
     env_key_map = {
-        "sub_endpoint": "DABAI_SUB_ENDPOINT",
-        "sub_topic": "DABAI_SUB_TOPIC",
-        "sub_timeout_ms": "DABAI_SUB_TIMEOUT_MS",
-        "pub_endpoint": "DABAI_PUB_ENDPOINT",
-        "web_host": "DABAI_WEB_HOST",
-        "web_port": "DABAI_WEB_PORT",
-        "yolo_conf": "DABAI_YOLO_CONF",
-        "yolo_imgsz": "DABAI_YOLO_IMGSZ",
-        "yolo_device": "DABAI_YOLO_DEVICE",
-        "yolo_precision": "DABAI_YOLO_PRECISION",
-        "yolo_warmup": "DABAI_YOLO_WARMUP",
-        "geom_backend": "DABAI_GEOM_BACKEND",
-        "geom_parity_check": "DABAI_GEOM_PARITY_CHECK",
-        "geom_parity_every_n": "DABAI_GEOM_PARITY_EVERY_N",
-        "infer_every_n": "DABAI_INFER_EVERY_N",
-        "geometry_every_n": "DABAI_GEOMETRY_EVERY_N",
-        "geometry_force_recalc_iou": "DABAI_GEOMETRY_FORCE_RECALC_IOU",
-        "center_depth_window": "DABAI_CENTER_DEPTH_WINDOW",
-        "min_depth_mm": "DABAI_MIN_DEPTH_MM",
-        "max_depth_mm": "DABAI_MAX_DEPTH_MM",
-        "ransac_residual_mm": "DABAI_RANSAC_RESIDUAL_MM",
-        "ransac_max_trials": "DABAI_RANSAC_MAX_TRIALS",
-        "ground_fit_fast_enabled": "DABAI_GROUND_FIT_FAST_ENABLED",
-        "ground_fit_fast_sample_cap": "DABAI_GROUND_FIT_FAST_SAMPLE_CAP",
-        "ground_fit_fast_max_trials": "DABAI_GROUND_FIT_FAST_MAX_TRIALS",
-        "ground_fit_fast_min_inlier_ratio": "DABAI_GROUND_FIT_FAST_MIN_INLIER_RATIO",
-        "ground_fit_fast_min_inliers": "DABAI_GROUND_FIT_FAST_MIN_INLIERS",
-        "dbscan_eps_mm": "DABAI_DBSCAN_EPS_MM",
-        "dbscan_min_samples": "DABAI_DBSCAN_MIN_SAMPLES",
-        "min_object_points": "DABAI_MIN_OBJECT_POINTS",
-        "max_points_for_geometry": "DABAI_MAX_POINTS_FOR_GEOMETRY",
-        "gripper_width_limit_mm": "DABAI_GRIPPER_WIDTH_LIMIT_MM",
-        "grasp_window_len_mm": "DABAI_GRASP_WINDOW_LEN_MM",
-        "grasp_window_step_mm": "DABAI_GRASP_WINDOW_STEP_MM",
-        "grasp_window_min_points": "DABAI_GRASP_WINDOW_MIN_POINTS",
-        "object_height_min_mm": "DABAI_OBJECT_HEIGHT_MIN_MM",
-        "support_close_px": "DABAI_SUPPORT_CLOSE_PX",
-        "axis_eig_ratio_min": "DABAI_AXIS_EIG_RATIO_MIN",
-        "axis_hold_frames": "DABAI_AXIS_HOLD_FRAMES",
-        "axis_smooth_alpha": "DABAI_AXIS_SMOOTH_ALPHA",
-        "target_lock_iou_min": "DABAI_TARGET_LOCK_IOU_MIN",
-        "target_lock_hits": "DABAI_TARGET_LOCK_HITS",
-        "target_lost_hold_frames": "DABAI_TARGET_LOST_HOLD_FRAMES",
-        "target_max_center_jump_px": "DABAI_TARGET_MAX_CENTER_JUMP_PX",
-        "target_max_depth_jump_mm": "DABAI_TARGET_MAX_DEPTH_JUMP_MM",
-        "support_switch_hold_frames": "DABAI_SUPPORT_SWITCH_HOLD_FRAMES",
-        "depth_valid_ratio_min": "DABAI_DEPTH_VALID_RATIO_MIN",
-        "support_points_min": "DABAI_SUPPORT_POINTS_MIN",
-        "support_fill_ratio_min": "DABAI_SUPPORT_FILL_RATIO_MIN",
-        "ground_ratio_max": "DABAI_GROUND_RATIO_MAX",
-        "quality_score_min": "DABAI_QUALITY_SCORE_MIN",
-        "grasp_point_smooth_alpha": "DABAI_GRASP_POINT_SMOOTH_ALPHA",
-        "grasp_yaw_smooth_alpha": "DABAI_GRASP_YAW_SMOOTH_ALPHA",
-        "grasp_hold_frames": "DABAI_GRASP_HOLD_FRAMES",
-        "grasp_jump_xy_mm": "DABAI_GRASP_JUMP_XY_MM",
-        "grasp_jump_z_mm": "DABAI_GRASP_JUMP_Z_MM",
-        "grasp_jump_yaw_deg": "DABAI_GRASP_JUMP_YAW_DEG",
-        "annotated_jpeg_quality": "DABAI_ANNOTATED_JPEG_QUALITY",
-        "stale_frame_sec": "DABAI_STALE_FRAME_SEC",
-        "jpeg_quality": "DABAI_JPEG_QUALITY",
-        "wait_ms": "DABAI_WAIT_MS",
-        "color_fps": "DABAI_COLOR_FPS",
-        "depth_fps": "DABAI_DEPTH_FPS",
-        "align_mode": "DABAI_ALIGN_MODE",
-        "frame_sync": "DABAI_FRAME_SYNC",
-        "ob_log_level": "DABAI_OB_LOG_LEVEL",
-        "uvicorn_log_level": "DABAI_UVICORN_LOG_LEVEL",
-        "uvicorn_access_log": "DABAI_UVICORN_ACCESS_LOG",
-        "skip_build": "DABAI_SKIP_BUILD",
-        "force_rebuild": "DABAI_FORCE_REBUILD",
-        "robot_control_enabled": "DABAI_ROBOT_CONTROL_ENABLED",
-        "robot_loopback_only": "DABAI_ROBOT_LOOPBACK_ONLY",
-        "robot_backend_override": "DABAI_ROBOT_BACKEND_OVERRIDE",
+        "stream.sub_endpoint": "DABAI_SUB_ENDPOINT",
+        "stream.sub_topic": "DABAI_SUB_TOPIC",
+        "stream.sub_timeout_ms": "DABAI_SUB_TIMEOUT_MS",
+        "stream.pub_endpoint": "DABAI_PUB_ENDPOINT",
+        "service.web_host": "DABAI_WEB_HOST",
+        "service.web_port": "DABAI_WEB_PORT",
+        "detector.yolo_conf": "DABAI_YOLO_CONF",
+        "detector.yolo_imgsz": "DABAI_YOLO_IMGSZ",
+        "detector.yolo_device": "DABAI_YOLO_DEVICE",
+        "detector.yolo_precision": "DABAI_YOLO_PRECISION",
+        "detector.yolo_warmup": "DABAI_YOLO_WARMUP",
+        "geometry.geom_backend": "DABAI_GEOM_BACKEND",
+        "geometry.geom_parity_check": "DABAI_GEOM_PARITY_CHECK",
+        "geometry.geom_parity_every_n": "DABAI_GEOM_PARITY_EVERY_N",
+        "detector.infer_every_n": "DABAI_INFER_EVERY_N",
+        "geometry.geometry_every_n": "DABAI_GEOMETRY_EVERY_N",
+        "geometry.geometry_force_recalc_iou": "DABAI_GEOMETRY_FORCE_RECALC_IOU",
+        "geometry.center_depth_window": "DABAI_CENTER_DEPTH_WINDOW",
+        "geometry.min_depth_mm": "DABAI_MIN_DEPTH_MM",
+        "geometry.max_depth_mm": "DABAI_MAX_DEPTH_MM",
+        "geometry.ransac_residual_mm": "DABAI_RANSAC_RESIDUAL_MM",
+        "geometry.ransac_max_trials": "DABAI_RANSAC_MAX_TRIALS",
+        "geometry.ground_fit_fast_enabled": "DABAI_GROUND_FIT_FAST_ENABLED",
+        "geometry.ground_fit_fast_sample_cap": "DABAI_GROUND_FIT_FAST_SAMPLE_CAP",
+        "geometry.ground_fit_fast_max_trials": "DABAI_GROUND_FIT_FAST_MAX_TRIALS",
+        "geometry.ground_fit_fast_min_inlier_ratio": "DABAI_GROUND_FIT_FAST_MIN_INLIER_RATIO",
+        "geometry.ground_fit_fast_min_inliers": "DABAI_GROUND_FIT_FAST_MIN_INLIERS",
+        "geometry.dbscan_eps_mm": "DABAI_DBSCAN_EPS_MM",
+        "geometry.dbscan_min_samples": "DABAI_DBSCAN_MIN_SAMPLES",
+        "geometry.min_object_points": "DABAI_MIN_OBJECT_POINTS",
+        "geometry.max_points_for_geometry": "DABAI_MAX_POINTS_FOR_GEOMETRY",
+        "geometry.gripper_width_limit_mm": "DABAI_GRIPPER_WIDTH_LIMIT_MM",
+        "geometry.grasp_window_len_mm": "DABAI_GRASP_WINDOW_LEN_MM",
+        "geometry.grasp_window_step_mm": "DABAI_GRASP_WINDOW_STEP_MM",
+        "geometry.grasp_window_min_points": "DABAI_GRASP_WINDOW_MIN_POINTS",
+        "segmentation.object_height_min_mm": "DABAI_OBJECT_HEIGHT_MIN_MM",
+        "segmentation.support_close_px": "DABAI_SUPPORT_CLOSE_PX",
+        "segmentation.support_switch_hold_frames": "DABAI_SUPPORT_SWITCH_HOLD_FRAMES",
+        "segmentation.depth_valid_ratio_min": "DABAI_DEPTH_VALID_RATIO_MIN",
+        "segmentation.support_points_min": "DABAI_SUPPORT_POINTS_MIN",
+        "segmentation.support_fill_ratio_min": "DABAI_SUPPORT_FILL_RATIO_MIN",
+        "segmentation.ground_ratio_max": "DABAI_GROUND_RATIO_MAX",
+        "segmentation.segmentation_debug_dbscan": "DABAI_SEGMENTATION_DEBUG_DBSCAN",
+        "segmentation.seed_region_min_radius_px": "DABAI_SEED_REGION_MIN_RADIUS_PX",
+        "segmentation.seed_region_max_radius_px": "DABAI_SEED_REGION_MAX_RADIUS_PX",
+        "segmentation.seed_region_radius_step_px": "DABAI_SEED_REGION_RADIUS_STEP_PX",
+        "tracking.target_lock_iou_min": "DABAI_TARGET_LOCK_IOU_MIN",
+        "tracking.target_lock_hits": "DABAI_TARGET_LOCK_HITS",
+        "tracking.target_lost_hold_frames": "DABAI_TARGET_LOST_HOLD_FRAMES",
+        "tracking.target_max_center_jump_px": "DABAI_TARGET_MAX_CENTER_JUMP_PX",
+        "tracking.target_max_depth_jump_mm": "DABAI_TARGET_MAX_DEPTH_JUMP_MM",
+        "stability.axis_eig_ratio_min": "DABAI_AXIS_EIG_RATIO_MIN",
+        "stability.axis_hold_frames": "DABAI_AXIS_HOLD_FRAMES",
+        "stability.axis_smooth_alpha": "DABAI_AXIS_SMOOTH_ALPHA",
+        "stability.quality_score_min": "DABAI_QUALITY_SCORE_MIN",
+        "stability.grasp_point_smooth_alpha": "DABAI_GRASP_POINT_SMOOTH_ALPHA",
+        "stability.grasp_yaw_smooth_alpha": "DABAI_GRASP_YAW_SMOOTH_ALPHA",
+        "stability.grasp_hold_frames": "DABAI_GRASP_HOLD_FRAMES",
+        "stability.grasp_jump_xy_mm": "DABAI_GRASP_JUMP_XY_MM",
+        "stability.grasp_jump_z_mm": "DABAI_GRASP_JUMP_Z_MM",
+        "stability.grasp_jump_yaw_deg": "DABAI_GRASP_JUMP_YAW_DEG",
+        "service.annotated_jpeg_quality": "DABAI_ANNOTATED_JPEG_QUALITY",
+        "service.stale_frame_sec": "DABAI_STALE_FRAME_SEC",
+        "publisher.jpeg_quality": "DABAI_JPEG_QUALITY",
+        "publisher.wait_ms": "DABAI_WAIT_MS",
+        "publisher.color_fps": "DABAI_COLOR_FPS",
+        "publisher.depth_fps": "DABAI_DEPTH_FPS",
+        "publisher.align_mode": "DABAI_ALIGN_MODE",
+        "publisher.frame_sync": "DABAI_FRAME_SYNC",
+        "publisher.ob_log_level": "DABAI_OB_LOG_LEVEL",
+        "service.uvicorn_log_level": "DABAI_UVICORN_LOG_LEVEL",
+        "service.uvicorn_access_log": "DABAI_UVICORN_ACCESS_LOG",
+        "build.skip_build": "DABAI_SKIP_BUILD",
+        "build.force_rebuild": "DABAI_FORCE_REBUILD",
+        "control.robot_control_enabled": "DABAI_ROBOT_CONTROL_ENABLED",
+        "control.robot_loopback_only": "DABAI_ROBOT_LOOPBACK_ONLY",
+        "control.robot_backend_override": "DABAI_ROBOT_BACKEND_OVERRIDE",
+        "rollout.vision_pipeline": "DABAI_VISION_PIPELINE",
+        "rollout.dynamic_grasp_api": "DABAI_DYNAMIC_GRASP_API",
+        "rollout.shadow_compare": "DABAI_SHADOW_COMPARE",
+        "rollout.metrics_window_size": "DABAI_METRICS_WINDOW_SIZE",
+        "rollout.metrics_slow_frame_ms": "DABAI_METRICS_SLOW_FRAME_MS",
     }
+    grouped_vision_sections = {
+        "stream",
+        "service",
+        "publisher",
+        "build",
+        "detector",
+        "geometry",
+        "tracking",
+        "segmentation",
+        "stability",
+        "control",
+        "rollout",
+        "extra_env",
+    }
+    deprecated_flat_keys = sorted(
+        key
+        for key, value in section.items()
+        if key not in grouped_vision_sections
+        and key in {source_key.split(".")[-1] for source_key in env_key_map.keys()} | {"yolo_model"}
+        and not isinstance(value, dict)
+    )
+    if deprecated_flat_keys:
+        joined = ", ".join(deprecated_flat_keys)
+        raise ValueError(
+            "vision_runtime contains deprecated flat keys: "
+            f"{joined}. Run scripts/migrate_pipeline_vision_runtime_v2.py --config <path> --in-place."
+        )
 
     env: dict[str, str] = {}
     for source_key, env_key in env_key_map.items():
-        if source_key not in section:
-            continue
-        value = section.get(source_key)
+        value = _read_path_value(source_key)
         if value is None:
             continue
-        if source_key == "robot_backend_override" and str(value).strip() == "":
+        if env_key == "DABAI_ROBOT_BACKEND_OVERRIDE" and str(value).strip() == "":
             continue
         if isinstance(value, bool):
             env[env_key] = "1" if value else "0"
         else:
             env[env_key] = str(value)
 
-    yolo_model = str(section.get("yolo_model", "")).strip()
+    yolo_model = str(_read_path_value("detector.yolo_model") or "").strip()
     if yolo_model:
         env["DABAI_YOLO_MODEL"] = _resolve_path(path, yolo_model)
 

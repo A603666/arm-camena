@@ -12,6 +12,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 @dataclass(frozen=True)
 class VisionConfig:
     base_url: str
+    api_version: str
     poll_hz: float
     health_timeout_sec: float
     target_stable_frames: int
@@ -43,6 +44,7 @@ class GraspConfig:
     open_width_m: float
     close_width_m: float
     force_n: float
+    verify_enabled: bool
     prepick_offset_m: float
     final_z_offset_m: float
     max_descent_m: float
@@ -157,6 +159,9 @@ def load_app_config(path: str | Path) -> AppConfig:
     grasp = _require_section(root, "grasp")
     route = _require_section(root, "route")
     runtime = _require_section(root, "runtime")
+    api_version = str(vision.get("api_version", "v2")).strip().lower() or "v2"
+    if api_version != "v2":
+        raise ValueError(f"vision.api_version must be v2, got {api_version!r}")
     if "prepick_offset_m" in grasp:
         prepick_offset_m = max(0.0, _as_float(grasp, "prepick_offset_m", 0.05))
     elif "hover_clearance_m" in grasp:
@@ -168,6 +173,7 @@ def load_app_config(path: str | Path) -> AppConfig:
         config_path=config_path,
         vision=VisionConfig(
             base_url=str(vision.get("base_url", "http://127.0.0.1:18000")).rstrip("/"),
+            api_version=api_version,
             poll_hz=max(0.5, _as_float(vision, "poll_hz", 12.0)),
             health_timeout_sec=max(0.2, _as_float(vision, "health_timeout_sec", 2.0)),
             target_stable_frames=max(1, _as_int(vision, "target_stable_frames", 3)),
@@ -197,6 +203,7 @@ def load_app_config(path: str | Path) -> AppConfig:
             open_width_m=max(0.0, _as_float(grasp, "open_width_m", 0.05)),
             close_width_m=max(0.0, _as_float(grasp, "close_width_m", 0.0)),
             force_n=max(0.0, _as_float(grasp, "force_n", 1.0)),
+            verify_enabled=_as_bool(grasp, "verify_enabled", False),
             prepick_offset_m=prepick_offset_m,
             final_z_offset_m=_as_float(grasp, "final_z_offset_m", 0.0),
             max_descent_m=max(0.01, _as_float(grasp, "max_descent_m", 0.35)),

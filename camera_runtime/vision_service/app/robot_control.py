@@ -4,6 +4,9 @@ import contextlib
 import importlib.util
 import io
 import math
+import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -56,6 +59,16 @@ GRAVITY_INTERLOCKED_COMMANDS = {
     "run_threepoint_step_next",
 }
 
+DAEMON_INTERLOCKED_COMMANDS = {
+    "home",
+    "run_threepoint_auto",
+    "run_threepoint_step_start",
+    "run_threepoint_step_next",
+}
+
+ROBOT_EXCLUSIVE_ENV = "DABAI_ROBOT_EXCLUSIVE_CONTROL"
+AUTO_ENABLE_SERVICE_NAME = "nero-auto-enable.service"
+
 
 class RobotControlManager:
     """Web-safe robot control adapter built on top of NeroArmTester."""
@@ -81,7 +94,15 @@ class RobotControlManager:
         self._speed_percent: int | None = None
         self._pick_override: dict[str, Any] | None = None
         self._ctrl_mode_hint: int | None = None
-        self._flange_to_optical: np.ndarray | None = self._load_handeye_flange_to_optical()
+        self._handeye_mode_required = "calibrated"
+        (
+            self._flange_to_optical,
+            self._handeye_source_effective,
+            self._handeye_error,
+        ) = self._load_handeye_flange_to_optical()
+        self._handeye_tcp_offset_m_rad: list[float] | None = self._load_handeye_tcp_offset_m_rad()
+        self._pick_override_safety = self._load_pick_override_safety_config(self._arm_config_path)
+        self._dynamic_stability_config = self._load_dynamic_stability_config(self._arm_config_path)
         self._last_result: dict[str, Any] = {
             "ok": False,
             "command": "",
@@ -153,6 +174,11 @@ class RobotControlManager:
 
         gravity_comp_active = bool(ctrl_mode == GRAVITY_COMP_CTRL_MODE)
         ctrl_mode_label = self._format_ctrl_mode_label(ctrl_mode, inferred=ctrl_mode_inferred)
+        handeye_error = self._handeye_error
+        if self._handeye_tcp_offset_m_rad is None:
+            handeye_error = handeye_error or "handeye tcp offset unavailable"
+        handeye_ready = self._flange_to_optical is not None and self._handeye_tcp_offset_m_rad is not None and handeye_error is None
+        handeye_source_effective = str(self._handeye_source_effective if self._flange_to_optical is not None else "unavailable")
 
         return {
             "enabled": self._enabled,
@@ -169,9 +195,23 @@ class RobotControlManager:
             "pick_override_close_width": pick_override_meta["close_width"],
             "pick_override_force": pick_override_meta["force"],
             "pick_override_smooth_segments": pick_override_meta["smooth_segments"],
+            "dynamic_stability_config": {
+                "window": int(self._dynamic_stability_config["window"]),
+                "min_axis_quality": float(self._dynamic_stability_config["min_axis_quality"]),
+                "mad_limit": {
+                    "x": float(self._dynamic_stability_config["mad_limit"]["x"]),
+                    "y": float(self._dynamic_stability_config["mad_limit"]["y"]),
+                    "z": float(self._dynamic_stability_config["mad_limit"]["z"]),
+                    "yaw": float(self._dynamic_stability_config["mad_limit"]["yaw"]),
+                },
+            },
             "gravity_compensation_active": gravity_comp_active,
             "ctrl_mode": ctrl_mode,
             "ctrl_mode_label": ctrl_mode_label,
+            "handeye_mode_required": str(self._handeye_mode_required),
+            "handeye_source_effective": handeye_source_effective,
+            "handeye_ready": bool(handeye_ready),
+            "handeye_error": handeye_error,
         }
 
     def execute_command(self, command: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -262,6 +302,18 @@ class RobotControlManager:
         return result
 
     def _execute_command_locked(self, command: str, params: dict[str, Any] | None) -> dict[str, Any]:
+        if command in DAEMON_INTERLOCKED_COMMANDS:
+            conflict_message = self._get_daemon_conflict_message()
+            if conflict_message is not None:
+                return self._build_result(
+                    False,
+                    command,
+                    conflict_message,
+                    [],
+                    self._safe_diag(),
+                    error_code="daemon_conflict",
+                )
+
         try:
             tester = self._ensure_tester()
         except Exception as exc:
@@ -375,7 +427,23 @@ class RobotControlManager:
             return self._build_result(ok, command, "points listed", lines, self._safe_diag(tester))
 
         if command == "run_threepoint_auto":
-            ok, lines = self._capture_output(lambda: bool(tester._run_threepoint_sequence(step_mode=False)))
+            try:
+                steps = self._build_threepoint_steps(tester)
+            except Exception as exc:
+                return self._build_result(
+                    False,
+                    command,
+                    f"threepoint auto init failed: {exc}",
+                    [],
+                    self._safe_diag(tester),
+                    error_code="invalid_params",
+                )
+
+            runner = getattr(tester, "_run_steps", None)
+            if callable(runner):
+                ok, lines = self._capture_output(lambda: bool(runner(steps, False)))
+            else:
+                ok, lines = self._capture_output(lambda: bool(tester._run_threepoint_sequence(step_mode=False)))
             with self._state_lock:
                 self._step_session = None
                 self._clear_pick_override_unlocked(tester)
@@ -605,6 +673,8 @@ class RobotControlManager:
 
         with contextlib.suppress(Exception):
             tester.backend.set_speed_percent(int(tester.speed_percent))
+        with contextlib.suppress(Exception):
+            self._sync_backend_tcp_offset(tester)
         with self._state_lock:
             self._speed_percent = int(getattr(tester, "speed_percent", 0))
         ctrl_mode = self._read_ctrl_mode_from_robot(tester)
@@ -661,15 +731,9 @@ class RobotControlManager:
         return WebNeroArmTester(cfg_path, backend_override)
 
     def _build_threepoint_steps(self, tester: Any) -> list[tuple[str, Callable[[], bool]]]:
-        pose_key = tester._active_pose_key()
-        for name in getattr(tester, "threepoint_info", {}).keys() or ("ready", "pick", "transport", "dump"):
-            info = tester.threepoint_info.get(name, {})
-            pose = info.get(pose_key)
-            if not isinstance(pose, list) or len(pose) != 6:
-                raise ValueError(f"missing threepoint pose ({pose_key}): {name}")
-
         with self._state_lock:
             override = dict(self._pick_override) if self._pick_override is not None else None
+        self._sync_tester_override_context(tester, override)
 
         gc = tester.cfg.get("gripper", {}) if isinstance(tester.cfg.get("gripper", {}), dict) else {}
         open_width = float(gc.get("open_width", 0.05))
@@ -686,40 +750,113 @@ class RobotControlManager:
         task = tester.cfg.get("task", {}) if isinstance(tester.cfg.get("task", {}), dict) else {}
         save_name = str(task.get("save_closed_state_waypoint", "grip_closed_at_pick")).strip() or "grip_closed_at_pick"
 
-        def move_pose(name: str, label: str, motion: str, segmented: bool) -> bool:
-            if segmented and smooth_segments > 1:
-                return self._move_threepoint_pose_segmented(tester, name=name, label=label, motion=motion, segments=smooth_segments)
-            return bool(tester._move_threepoint_pose(name, label, motion))
+        builder = getattr(tester, "_build_threepoint_steps", None)
+        if callable(builder):
+            steps_raw = builder()
+            if not isinstance(steps_raw, list):
+                raise ValueError("invalid threepoint step builder result")
+            steps: list[tuple[str, Callable[[], bool]]] = []
+            for item in steps_raw:
+                if (
+                    not isinstance(item, tuple)
+                    or len(item) != 2
+                    or not isinstance(item[0], str)
+                    or not callable(item[1])
+                ):
+                    raise ValueError("invalid threepoint step item")
+                steps.append((item[0], item[1]))
+        else:
+            pose_key = tester._active_pose_key()
+            for name in getattr(tester, "threepoint_info", {}).keys() or ("ready", "pick", "transport", "dump"):
+                info = tester.threepoint_info.get(name, {})
+                pose = info.get(pose_key)
+                if not isinstance(pose, list) or len(pose) != 6:
+                    raise ValueError(f"missing threepoint pose ({pose_key}): {name}")
 
-        return [
-            ("move ready", lambda: tester._move_threepoint_pose("ready", "move ready", tester.transfer_motion)),
-            ("open gripper (ready)", lambda: tester.backend.open_gripper(open_width, force)),
-            ("move pick", lambda: move_pose("pick", "move pick", tester.approach_motion, segmented=True)),
-            ("close gripper", lambda: tester.backend.close_gripper(close_width, force)),
-            (f"save closed state {save_name}", lambda: tester._save_runtime_state(save_name)),
-            (
-                "move ready (keep gripper closed)",
-                lambda: move_pose("ready", "move ready (keep gripper closed)", tester.transfer_motion, segmented=True),
-            ),
-            (
-                "move transport (keep gripper closed)",
-                lambda: tester._move_threepoint_pose(
-                    "transport",
-                    "move transport (keep gripper closed)",
-                    tester.transfer_motion,
+            def move_pose(name: str, label: str, motion: str, segmented: bool) -> bool:
+                if segmented and smooth_segments > 1:
+                    return self._move_threepoint_pose_segmented(
+                        tester,
+                        name=name,
+                        label=label,
+                        motion=motion,
+                        segments=smooth_segments,
+                    )
+                return bool(tester._move_threepoint_pose(name, label, motion))
+
+            steps = [
+                ("move ready", lambda: tester._move_threepoint_pose("ready", "move ready", tester.transfer_motion)),
+                ("open gripper (ready)", lambda: tester.backend.open_gripper(open_width, force)),
+                ("move pick", lambda: move_pose("pick", "move pick", tester.approach_motion, segmented=True)),
+                ("close gripper", lambda: tester.backend.close_gripper(close_width, force)),
+                (f"save closed state {save_name}", lambda: tester._save_runtime_state(save_name)),
+                (
+                    "move ready (keep gripper closed)",
+                    lambda: move_pose("ready", "move ready (keep gripper closed)", tester.transfer_motion, segmented=True),
                 ),
-            ),
-            ("move dump", lambda: tester._move_threepoint_pose("dump", "move dump", tester.approach_motion)),
-            ("open gripper (dump)", lambda: tester.backend.open_gripper(open_width, force)),
-            (
-                "move transport (return)",
-                lambda: tester._move_threepoint_pose("transport", "move transport (return)", tester.transfer_motion),
-            ),
-            (
-                "move ready (return)",
-                lambda: tester._move_threepoint_pose("ready", "move ready (return)", tester.transfer_motion),
-            ),
-        ]
+                (
+                    "move transport (keep gripper closed)",
+                    lambda: tester._move_threepoint_pose(
+                        "transport",
+                        "move transport (keep gripper closed)",
+                        tester.transfer_motion,
+                    ),
+                ),
+                ("move dump", lambda: tester._move_threepoint_pose("dump", "move dump", tester.approach_motion)),
+                ("open gripper (dump)", lambda: tester.backend.open_gripper(open_width, force)),
+                (
+                    "move transport (return)",
+                    lambda: tester._move_threepoint_pose("transport", "move transport (return)", tester.transfer_motion),
+                ),
+                (
+                    "move ready (return)",
+                    lambda: tester._move_threepoint_pose("ready", "move ready (return)", tester.transfer_motion),
+                ),
+            ]
+
+        profile = str(getattr(tester, "execution_profile", "pose_only")).strip().lower() or "pose_only"
+        normalized_steps: list[tuple[str, Callable[[], bool]]] = []
+        for label, action in steps:
+            if label == "close gripper":
+                normalized_steps.append(
+                    (label, lambda close_w=close_width, grip_force=force: tester.backend.close_gripper(close_w, grip_force))
+                )
+                continue
+
+            if smooth_segments > 1 and profile != "joint_first":
+                if label == "move pick":
+                    approach_motion = str(getattr(tester, "approach_motion", "p")).strip().lower() or "p"
+                    normalized_steps.append(
+                        (
+                            label,
+                            lambda segments=smooth_segments, move_mode=approach_motion: self._move_threepoint_pose_segmented(
+                                tester,
+                                name="pick",
+                                label="move pick",
+                                motion=move_mode,
+                                segments=segments,
+                            ),
+                        )
+                    )
+                    continue
+                if label == "move ready (keep gripper closed)":
+                    transfer_motion = str(getattr(tester, "transfer_motion", "p")).strip().lower() or "p"
+                    normalized_steps.append(
+                        (
+                            label,
+                            lambda segments=smooth_segments, move_mode=transfer_motion: self._move_threepoint_pose_segmented(
+                                tester,
+                                name="ready",
+                                label="move ready (keep gripper closed)",
+                                motion=move_mode,
+                                segments=segments,
+                            ),
+                        )
+                    )
+                    continue
+
+            normalized_steps.append((label, action))
+        return normalized_steps
 
     def _move_threepoint_pose_segmented(
         self,
@@ -729,8 +866,22 @@ class RobotControlManager:
         motion: str,
         segments: int,
     ) -> bool:
+        motion_mode = str(motion).strip().lower() or "p"
+        if motion_mode not in {"p", "l"}:
+            print(f"[ERR] {label}: unsupported segmented motion '{motion_mode}'")
+            return False
+
         if segments <= 1:
-            return bool(tester._move_threepoint_pose(name, label, motion))
+            return bool(tester._move_threepoint_pose(name, label, motion_mode))
+
+        # Official SDK docs warn against continuously streaming move_l targets.
+        # Keep smooth segmentation strictly on move_p; move_l stays single-shot.
+        if motion_mode == "l":
+            print(
+                f"[WARN] {label}: smooth_segments={int(segments)} is not applied to move_l; "
+                "fallback to single move_l"
+            )
+            return bool(tester._move_threepoint_pose(name, label, motion_mode))
 
         info = tester.threepoint_info.get(name, {})
         pose_key = tester._active_pose_key()
@@ -757,7 +908,7 @@ class RobotControlManager:
                 for i in range(6)
             ]
             step_label = label if idx == segments else f"{label} seg{idx}/{segments}"
-            if not bool(executor(pose, step_label, motion)):
+            if not bool(executor(pose, step_label, motion_mode)):
                 return False
         return True
 
@@ -806,31 +957,218 @@ class RobotControlManager:
         return out / norm
 
     @classmethod
-    def _load_handeye_flange_to_optical(cls) -> np.ndarray | None:
-        repo_root = Path(__file__).resolve().parents[3]
-        handeye_path = repo_root / "模型文件" / "nero_description" / "config" / "handeye_extrinsics.yaml"
+    def _load_handeye_flange_to_optical(cls) -> tuple[np.ndarray | None, str, str | None]:
+        handeye_path = cls._handeye_path()
         if not handeye_path.exists():
-            return None
+            return None, "unavailable", f"handeye extrinsics file not found: {handeye_path}"
         try:
             raw = yaml.safe_load(handeye_path.read_text(encoding="utf-8")) or {}
             if not isinstance(raw, dict):
-                return None
+                return None, "unavailable", "invalid handeye yaml format"
             nominal = raw.get("nominal_camera")
             if not isinstance(nominal, dict):
-                return None
+                return None, "unavailable", "nominal_camera section missing in handeye yaml"
             calibrated = raw.get("calibrated_camera")
-            camera_source = nominal
-            if isinstance(calibrated, dict) and bool(calibrated.get("enabled", False)):
-                camera_source = calibrated
+            if not isinstance(calibrated, dict) or not bool(calibrated.get("enabled", False)):
+                return (
+                    None,
+                    "unavailable",
+                    "calibrated handeye unavailable: calibrated_camera.enabled=true is required",
+                )
+            camera_source = calibrated
             cam_xyz = camera_source.get("xyz_m", nominal.get("xyz_m", [0.0, 0.0, 0.0]))
             cam_rpy = camera_source.get("rpy_rad", nominal.get("rpy_rad", [0.0, 0.0, 0.0]))
             opt_xyz = nominal.get("optical_xyz_m", [0.0, 0.0, 0.0])
             opt_rpy = nominal.get("optical_rpy_rad", [0.0, 0.0, 0.0])
             flange_to_camera = cls._pose_to_matrix([float(v) for v in [*cam_xyz, *cam_rpy]])
             camera_to_optical = cls._pose_to_matrix([float(v) for v in [*opt_xyz, *opt_rpy]])
-            return flange_to_camera @ camera_to_optical
+            return flange_to_camera @ camera_to_optical, "calibrated", None
+        except Exception as exc:
+            return None, "unavailable", f"calibrated handeye load failed: {exc}"
+
+    @classmethod
+    def _handeye_path(cls) -> Path:
+        repo_root = Path(__file__).resolve().parents[3]
+        return repo_root / "模型文件" / "nero_description" / "config" / "handeye_extrinsics.yaml"
+
+    @staticmethod
+    def _as_float(raw: Any, default: float) -> float:
+        try:
+            return float(raw)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _as_int(raw: Any, default: int) -> int:
+        try:
+            return int(raw)
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(float(low), min(float(high), float(value)))
+
+    @classmethod
+    def _load_yaml_mapping(cls, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    @classmethod
+    def _load_pick_override_safety_config(cls, arm_config_path: Path) -> dict[str, float]:
+        defaults = {
+            "prepick_offset_m": 0.05,
+            "max_descent_m": 0.35,
+            "min_safe_z_m": 0.10,
+        }
+        raw = cls._load_yaml_mapping(arm_config_path)
+        grasp_cfg: dict[str, Any] = {}
+        dynamic_grasp = raw.get("dynamic_grasp")
+        if isinstance(dynamic_grasp, dict):
+            grasp = dynamic_grasp.get("grasp")
+            if isinstance(grasp, dict):
+                grasp_cfg = grasp
+        elif isinstance(raw.get("grasp"), dict):
+            grasp_cfg = raw.get("grasp")
+        return {
+            "prepick_offset_m": max(0.0, cls._as_float(grasp_cfg.get("prepick_offset_m"), defaults["prepick_offset_m"])),
+            "max_descent_m": max(0.01, cls._as_float(grasp_cfg.get("max_descent_m"), defaults["max_descent_m"])),
+            # Preserve configured frame convention (some setups legitimately use negative Z in base frame).
+            "min_safe_z_m": cls._as_float(grasp_cfg.get("min_safe_z_m"), defaults["min_safe_z_m"]),
+        }
+
+    @classmethod
+    def _load_dynamic_stability_config(cls, arm_config_path: Path) -> dict[str, Any]:
+        defaults = {
+            "window": 18,
+            "min_axis_quality": 0.85,
+            "mad_limit": {"x": 1.5, "y": 1.5, "z": 2.0, "yaw": 1.2},
+        }
+        raw = cls._load_yaml_mapping(arm_config_path)
+        source: dict[str, Any] = {}
+        dynamic_grasp = raw.get("dynamic_grasp")
+        if isinstance(dynamic_grasp, dict):
+            vision = dynamic_grasp.get("vision")
+            if isinstance(vision, dict):
+                source = vision
+        if not source and isinstance(raw.get("robot_runtime"), dict):
+            rr = raw.get("robot_runtime")
+            if isinstance(rr, dict):
+                wds = rr.get("web_dynamic_stability")
+                if isinstance(wds, dict):
+                    source = wds
+
+        nested = source.get("web_dynamic_stability")
+        if isinstance(nested, dict):
+            source = dict(source)
+            source.update(nested)
+
+        mad_source = source.get("mad_limit")
+        if not isinstance(mad_source, dict):
+            mad_source = {}
+        x_limit = cls._as_float(mad_source.get("x", source.get("web_dynamic_mad_limit_x_mm")), defaults["mad_limit"]["x"])
+        y_limit = cls._as_float(mad_source.get("y", source.get("web_dynamic_mad_limit_y_mm")), defaults["mad_limit"]["y"])
+        z_limit = cls._as_float(mad_source.get("z", source.get("web_dynamic_mad_limit_z_mm")), defaults["mad_limit"]["z"])
+        yaw_limit = cls._as_float(
+            mad_source.get("yaw", source.get("web_dynamic_mad_limit_yaw_deg")),
+            defaults["mad_limit"]["yaw"],
+        )
+        return {
+            "window": max(3, min(120, cls._as_int(source.get("window", source.get("web_dynamic_window")), defaults["window"]))),
+            "min_axis_quality": cls._clamp(
+                cls._as_float(source.get("min_axis_quality", source.get("web_dynamic_min_axis_quality")), defaults["min_axis_quality"]),
+                0.0,
+                1.0,
+            ),
+            "mad_limit": {
+                "x": max(0.1, float(x_limit)),
+                "y": max(0.1, float(y_limit)),
+                "z": max(0.1, float(z_limit)),
+                "yaw": max(0.1, float(yaw_limit)),
+            },
+        }
+
+    @classmethod
+    def _matrix_to_pose_m_rad(cls, matrix_4x4: np.ndarray) -> list[float]:
+        if matrix_4x4.shape != (4, 4):
+            raise ValueError("matrix must be 4x4")
+        rot = matrix_4x4[:3, :3]
+        x = float(matrix_4x4[0, 3])
+        y = float(matrix_4x4[1, 3])
+        z = float(matrix_4x4[2, 3])
+
+        sp = cls._clamp(-float(rot[2, 0]), -1.0, 1.0)
+        pitch = math.asin(sp)
+        cp = math.cos(pitch)
+        if abs(cp) > 1e-8:
+            roll = math.atan2(float(rot[2, 1]), float(rot[2, 2]))
+            yaw = math.atan2(float(rot[1, 0]), float(rot[0, 0]))
+        else:
+            roll = 0.0
+            yaw = math.atan2(float(-rot[0, 1]), float(rot[1, 1]))
+        return [x, y, z, roll, pitch, yaw]
+
+    @classmethod
+    def _load_handeye_tcp_offset_m_rad(cls) -> list[float] | None:
+        handeye_path = cls._handeye_path()
+        if not handeye_path.exists():
+            return None
+        try:
+            raw = yaml.safe_load(handeye_path.read_text(encoding="utf-8")) or {}
+            if not isinstance(raw, dict):
+                return None
+            gripper = raw.get("gripper_nominal")
+            if not isinstance(gripper, dict):
+                return None
+            flange_to_mount = cls._pose_to_matrix(
+                [*gripper.get("mount_xyz_m", [0.0, 0.0, 0.0]), *gripper.get("mount_rpy_rad", [0.0, 0.0, 0.0])]
+            )
+            mount_to_base = cls._pose_to_matrix([*gripper.get("xyz_m", [0.0, 0.0, 0.0]), *gripper.get("rpy_rad", [0.0, 0.0, 0.0])])
+            base_to_tcp = cls._pose_to_matrix(
+                [*gripper.get("tcp_xyz_m", [0.0, 0.0, 0.0]), *gripper.get("tcp_rpy_rad", [0.0, 0.0, 0.0])]
+            )
+            tcp_offset = cls._matrix_to_pose_m_rad(flange_to_mount @ mount_to_base @ base_to_tcp)
+            if len(tcp_offset) != 6:
+                return None
+            if not all(math.isfinite(float(v)) for v in tcp_offset):
+                return None
+            return [float(v) for v in tcp_offset]
         except Exception:
             return None
+
+    @staticmethod
+    def _sync_tester_override_context(tester: Any, override: dict[str, Any] | None) -> None:
+        if override is None:
+            if hasattr(tester, "_web_override_context"):
+                with contextlib.suppress(Exception):
+                    delattr(tester, "_web_override_context")
+            return
+        context = {
+            "active": True,
+            "mode": str(override.get("mode", "none")),
+            "static_pick_pose_m_rad": list(override.get("original_pick_pose_m_rad", [])),
+            "override_pick_pose_m_rad": list(override.get("applied_pick_pose_m_rad", [])),
+            "override_pick_vs_static_pick_delta": list(override.get("pick_delta_m_rad", [])),
+        }
+        with contextlib.suppress(Exception):
+            setattr(tester, "_web_override_context", context)
+
+    def _sync_backend_tcp_offset(self, tester: Any) -> None:
+        tcp_offset = self._handeye_tcp_offset_m_rad
+        if tcp_offset is None:
+            return
+        backend = getattr(tester, "backend", None)
+        robot = getattr(backend, "robot", None) if backend is not None else None
+        if robot is None:
+            return
+        setter = getattr(robot, "set_tcp_offset", None)
+        if callable(setter):
+            setter([float(v) for v in tcp_offset])
 
     @staticmethod
     def _render_pick_override_meta(override: dict[str, Any] | None) -> dict[str, Any]:
@@ -891,6 +1229,10 @@ class RobotControlManager:
         if smooth_segments < 1 or smooth_segments > 10:
             return None, "invalid params: smooth_segments must be between 1 and 10"
         out["smooth_segments"] = smooth_segments
+        segmented_motion = str(params.get("segmented_motion", "p")).strip().lower() or "p"
+        if segmented_motion != "p":
+            return None, "invalid params: segmented_motion must be 'p' (segmented move_l is unsafe)"
+        out["segmented_motion"] = segmented_motion
 
         mode = str(params.get("mode", "random")).strip().lower()
         if mode not in {"random", "dynamic"}:
@@ -899,25 +1241,45 @@ class RobotControlManager:
 
         if out["close_width"] < 0.0:
             return None, "invalid params: close_width must be >= 0"
+        if out["close_width"] > 0.1:
+            return None, "invalid params: close_width must be <= 0.1"
         if out["force"] < 0.0:
             return None, "invalid params: force must be >= 0"
+        if out["force"] > 3.0:
+            return None, "invalid params: force must be <= 3.0"
         return out, None
 
     def _apply_pick_override_from_vision(self, tester: Any, params: dict[str, Any]) -> tuple[bool, str]:
         if self._flange_to_optical is None:
-            return False, "handeye extrinsics unavailable"
+            detail = self._handeye_error or "calibrated handeye unavailable"
+            return False, f"calibrated handeye unavailable: {detail}"
+        if self._handeye_tcp_offset_m_rad is None:
+            return False, "calibrated handeye unavailable: handeye tcp offset unavailable"
 
         current_flange = tester.backend.get_flange_pose()
         if not isinstance(current_flange, list) or len(current_flange) != 6:
             return False, "cannot apply pick override: no flange pose feedback"
+        if not all(math.isfinite(float(v)) for v in current_flange):
+            return False, "cannot apply pick override: flange pose has invalid values"
 
         pick_info = tester.threepoint_info.get("pick", {})
+        prepick_info = tester.threepoint_info.get("prepick", {})
         pick_pose = pick_info.get("pose_m_rad")
         pick_locked = pick_info.get("locked_pose_m_rad")
+        prepick_pose = prepick_info.get("pose_m_rad")
+        prepick_locked = prepick_info.get("locked_pose_m_rad")
+        ready_info = tester.threepoint_info.get("ready", {})
+        ready_pose = ready_info.get("pose_m_rad")
         if not isinstance(pick_pose, list) or len(pick_pose) != 6:
             return False, "cannot apply pick override: pick pose missing"
         if not isinstance(pick_locked, list) or len(pick_locked) != 6:
             pick_locked = list(pick_pose)
+        if not isinstance(prepick_pose, list) or len(prepick_pose) != 6:
+            return False, "cannot apply pick override: prepick pose missing"
+        if not isinstance(prepick_locked, list) or len(prepick_locked) != 6:
+            prepick_locked = list(prepick_pose)
+        if not isinstance(ready_pose, list) or len(ready_pose) != 6:
+            return False, "cannot apply pick override: ready pose missing"
 
         base_to_flange = self._pose_to_matrix([float(v) for v in current_flange])
         base_to_optical = base_to_flange @ self._flange_to_optical
@@ -930,12 +1292,25 @@ class RobotControlManager:
         axis_base = self._transform_direction(base_to_optical, axis_optical)
         yaw_base = math.atan2(float(axis_base[1]), float(axis_base[0]))
 
+        self._sync_backend_tcp_offset(tester)
+        backend = getattr(tester, "backend", None)
+        robot = getattr(backend, "robot", None) if backend is not None else None
+        converter = getattr(robot, "get_tcp2flange_pose", None) if robot is not None else None
+        if not callable(converter):
+            return False, "cannot apply pick override: tcp->flange transform unavailable"
+
+        prepick_offset_m = float(self._pick_override_safety["prepick_offset_m"])
+        max_descent_m = float(self._pick_override_safety["max_descent_m"])
+        min_safe_z_m = float(self._pick_override_safety["min_safe_z_m"])
+
         with self._state_lock:
             override = self._pick_override
             if override is None:
                 override = {
                     "original_pick_pose_m_rad": [float(v) for v in pick_pose],
                     "original_pick_locked_pose_m_rad": [float(v) for v in pick_locked],
+                    "original_prepick_pose_m_rad": [float(v) for v in prepick_pose],
+                    "original_prepick_locked_pose_m_rad": [float(v) for v in prepick_locked],
                 }
             original_pose = [float(v) for v in override["original_pick_pose_m_rad"]]
             ref_yaw = float(original_pose[5])
@@ -944,7 +1319,7 @@ class RobotControlManager:
             alt_err = abs(self._normalize_angle_rad(alt_yaw - ref_yaw))
             chosen_yaw = alt_yaw if alt_err + 1e-6 < main_err else yaw_base
 
-            applied_pick_pose = [
+            target_tcp_pose = [
                 float(point_base[0]),
                 float(point_base[1]),
                 float(point_base[2]),
@@ -952,9 +1327,38 @@ class RobotControlManager:
                 float(original_pose[4]),
                 float(chosen_yaw),
             ]
+            if target_tcp_pose[2] < min_safe_z_m:
+                return (
+                    False,
+                    f"reject override: pick.z={target_tcp_pose[2]:.4f}m below min_safe_z={min_safe_z_m:.4f}m",
+                )
+            descent_m = float(ready_pose[2]) - float(target_tcp_pose[2])
+            if descent_m > max_descent_m + 1e-9:
+                return (
+                    False,
+                    f"reject override: descent={descent_m:.4f}m exceeds max_descent={max_descent_m:.4f}m",
+                )
+
+            try:
+                converted = converter([float(v) for v in target_tcp_pose])
+            except Exception as exc:
+                return False, f"cannot apply pick override: tcp->flange transform failed ({exc})"
+            if not isinstance(converted, (list, tuple)) or len(converted) != 6:
+                return False, "cannot apply pick override: invalid tcp->flange result"
+            applied_pick_pose = [float(v) for v in converted]
+            if not all(math.isfinite(float(v)) for v in applied_pick_pose):
+                return False, "cannot apply pick override: tcp->flange result has invalid values"
+
+            applied_prepick_pose = list(applied_pick_pose)
+            applied_prepick_pose[2] = float(applied_pick_pose[2]) + prepick_offset_m
             applied_pick_locked_pose = list(applied_pick_pose)
+            applied_prepick_locked_pose = list(applied_prepick_pose)
             pick_info["pose_m_rad"] = list(applied_pick_pose)
             pick_info["locked_pose_m_rad"] = list(applied_pick_locked_pose)
+            prepick_info["pose_m_rad"] = list(applied_prepick_pose)
+            prepick_info["locked_pose_m_rad"] = list(applied_prepick_locked_pose)
+
+            pick_delta = [float(applied_pick_pose[i]) - float(original_pose[i]) for i in range(6)]
 
             override.update(
                 {
@@ -962,8 +1366,15 @@ class RobotControlManager:
                     "close_width": float(params["close_width"]),
                     "force": float(params["force"]),
                     "smooth_segments": int(params["smooth_segments"]),
+                    "applied_pick_target_tcp_pose_m_rad": list(target_tcp_pose),
                     "applied_pick_pose_m_rad": list(applied_pick_pose),
                     "applied_pick_locked_pose_m_rad": list(applied_pick_locked_pose),
+                    "applied_prepick_pose_m_rad": list(applied_prepick_pose),
+                    "applied_prepick_locked_pose_m_rad": list(applied_prepick_locked_pose),
+                    "pick_delta_m_rad": pick_delta,
+                    "prepick_offset_m": prepick_offset_m,
+                    "max_descent_m": max_descent_m,
+                    "min_safe_z_m": min_safe_z_m,
                     "source_optical_mm": [float(params["x_mm"]), float(params["y_mm"]), float(params["z_mm"])],
                     "source_yaw_deg": float(params["yaw_deg"]),
                     "applied_at": time.time(),
@@ -971,7 +1382,15 @@ class RobotControlManager:
             )
             self._pick_override = override
 
-        return True, "pick override applied"
+        message = "pick override applied"
+        smooth_segments = int(params["smooth_segments"])
+        approach_motion = str(getattr(tester, "approach_motion", "p")).strip().lower() or "p"
+        if smooth_segments > 1 and approach_motion == "l":
+            message = (
+                f"{message}; notice: smooth_segments={smooth_segments} only applies to move_p, "
+                "pick step will fallback to single move_l"
+            )
+        return True, message
 
     def _clear_pick_override_unlocked(self, tester: Any | None) -> bool:
         override = self._pick_override
@@ -980,13 +1399,24 @@ class RobotControlManager:
 
         if tester is not None:
             pick_info = getattr(tester, "threepoint_info", {}).get("pick", {})
+            prepick_info = getattr(tester, "threepoint_info", {}).get("prepick", {})
             original_pose = override.get("original_pick_pose_m_rad")
             original_locked = override.get("original_pick_locked_pose_m_rad")
+            original_prepick_pose = override.get("original_prepick_pose_m_rad")
+            original_prepick_locked = override.get("original_prepick_locked_pose_m_rad")
             if isinstance(pick_info, dict):
                 if isinstance(original_pose, list) and len(original_pose) == 6:
                     pick_info["pose_m_rad"] = [float(v) for v in original_pose]
                 if isinstance(original_locked, list) and len(original_locked) == 6:
                     pick_info["locked_pose_m_rad"] = [float(v) for v in original_locked]
+            if isinstance(prepick_info, dict):
+                if isinstance(original_prepick_pose, list) and len(original_prepick_pose) == 6:
+                    prepick_info["pose_m_rad"] = [float(v) for v in original_prepick_pose]
+                if isinstance(original_prepick_locked, list) and len(original_prepick_locked) == 6:
+                    prepick_info["locked_pose_m_rad"] = [float(v) for v in original_prepick_locked]
+            if hasattr(tester, "_web_override_context"):
+                with contextlib.suppress(Exception):
+                    delattr(tester, "_web_override_context")
 
         self._pick_override = None
         return True
@@ -998,6 +1428,42 @@ class RobotControlManager:
         with contextlib.suppress(Exception):
             return dict(live.backend.diagnostics())
         return {}
+
+    @staticmethod
+    def _is_truthy_env(raw: str | None) -> bool:
+        if raw is None:
+            return False
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _is_robot_exclusive_control(cls) -> bool:
+        return cls._is_truthy_env(os.environ.get(ROBOT_EXCLUSIVE_ENV))
+
+    @staticmethod
+    def _is_auto_enable_service_active() -> bool:
+        if shutil.which("systemctl") is None:
+            return False
+        try:
+            proc = subprocess.run(
+                ["systemctl", "is-active", "--quiet", AUTO_ENABLE_SERVICE_NAME],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return False
+        return proc.returncode == 0
+
+    @classmethod
+    def _get_daemon_conflict_message(cls) -> str | None:
+        if cls._is_robot_exclusive_control():
+            return None
+        if not cls._is_auto_enable_service_active():
+            return None
+        return (
+            "daemon conflict: nero-auto-enable.service is active; "
+            "stop it or relaunch vision with exclusive robot control"
+        )
 
     @staticmethod
     def _format_ctrl_mode_label(ctrl_mode: int | None, inferred: bool) -> str:

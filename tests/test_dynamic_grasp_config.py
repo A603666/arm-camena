@@ -152,6 +152,34 @@ runtime:
 
         self.assertAlmostEqual(cfg.grasp.prepick_offset_m, 0.05, places=6)
 
+    def test_rejects_legacy_vision_api_version_v1(self) -> None:
+        cfg_text = """
+vision:
+  base_url: http://127.0.0.1:18000
+  api_version: v1
+handeye:
+  mode: nominal
+  extrinsics_path: ./模型文件/nero_description/config/handeye_extrinsics.yaml
+scan:
+  max_offset_xy_m: 0.18
+grasp:
+  open_width_m: 0.05
+route:
+  ready_from: threepoint.ready
+  transport_from: threepoint.transport
+  dump_from: threepoint.dump
+runtime:
+  arm_config_path: ./robot_runtime/config/default.yaml
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8") as handle:
+            handle.write(cfg_text)
+            cfg_path = Path(handle.name)
+        try:
+            with self.assertRaisesRegex(ValueError, "vision.api_version must be v2"):
+                load_app_config(cfg_path)
+        finally:
+            cfg_path.unlink(missing_ok=True)
+
     def test_supports_unified_dynamic_grasp_root(self) -> None:
         cfg_text = """
 dynamic_grasp:

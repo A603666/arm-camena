@@ -35,6 +35,7 @@ TAG_ENABLE_OK = "ENABLE_OK"
 TAG_RECOVERING = "RECOVERING"
 TAG_RECOVERED = "RECOVERED"
 TAG_ENABLE_TIMEOUT = "ENABLE_TIMEOUT"
+TAG_RESET_RETRY = "RESET_RETRY"
 ENABLE_READINESS_POLL_SEC = 0.1
 ENABLE_POLL_SEC = 0.2
 ENABLE_PROGRESS_GRACE_SEC = 3.0
@@ -107,8 +108,8 @@ def load_config(path: Path) -> DaemonConfig:
 
     if not can_channel:
         raise ValueError("can_channel must not be empty")
-    if can_channel != "can0":
-        raise ValueError(f"can_channel must be can0 for USB-CAN deployment (got: {can_channel})")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,31}", can_channel) is None:
+        raise ValueError(f"can_channel must be a valid interface name (got: {can_channel})")
     if can_bitrate <= 0:
         raise ValueError("can_bitrate must be > 0")
     if not can_interface:
@@ -339,6 +340,46 @@ def ensure_enabled(
         time.sleep(ENABLE_POLL_SEC)
 
 
+def _reset_and_retry_enable(
+    robot: Any,
+    cfg: DaemonConfig,
+    logger: logging.Logger,
+) -> Tuple[bool, Optional[list[bool]], str]:
+    if not hasattr(robot, "reset"):
+        return False, None, "reset() not available in this SDK"
+
+    log_tag(logger, TAG_RESET_RETRY, "enable timeout(all_disabled) -> trying reset + set_normal_mode + enable")
+    try:
+        robot.reset()
+    except Exception as exc:
+        return False, None, f"reset failed: {exc}"
+
+    time.sleep(0.1)
+
+    if not hasattr(robot, "set_normal_mode"):
+        return False, None, "set_normal_mode() not available in this SDK"
+    try:
+        robot.set_normal_mode()
+        log_tag(logger, TAG_SET_NORMAL_MODE_OK, "set_normal_mode() completed after reset")
+    except Exception as exc:
+        return False, None, f"set_normal_mode failed after reset: {exc}"
+
+    ready_wait_sec = min(1.5, max(0.5, cfg.enable_timeout_sec * 0.2))
+    if wait_joint_ready(robot, ready_wait_sec):
+        logger.info("joint feedback became ready after reset (wait<=%.1fs)", ready_wait_sec)
+    else:
+        logger.warning(
+            "joint feedback still not ready after reset (waited %.1fs), continue enabling",
+            ready_wait_sec,
+        )
+
+    return ensure_enabled(
+        robot,
+        cfg.enable_timeout_sec,
+        progress_grace_sec=ENABLE_PROGRESS_GRACE_SEC,
+    )
+
+
 def establish_robot_session(cfg: DaemonConfig, logger: logging.Logger) -> Tuple[bool, Optional[Any], str]:
     iface = find_can_iface_by_usb(cfg.usb_bus_info)
     if iface is None:
@@ -390,6 +431,14 @@ def establish_robot_session(cfg: DaemonConfig, logger: logging.Logger) -> Tuple[
         cfg.enable_timeout_sec,
         progress_grace_sec=ENABLE_PROGRESS_GRACE_SEC,
     )
+    if not enabled and timeout_reason == "all_disabled":
+        retry_ok, retry_flags, retry_reason = _reset_and_retry_enable(robot, cfg, logger)
+        if retry_ok:
+            log_tag(logger, TAG_ENABLE_OK, "all joints enabled after reset retry")
+            return True, robot, ""
+        timeout_flags = retry_flags if retry_flags is not None else timeout_flags
+        timeout_reason = retry_reason or timeout_reason
+
     if not enabled:
         log_tag(
             logger,

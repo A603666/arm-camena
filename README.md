@@ -29,6 +29,7 @@
 
 - 关节 7 必须满足 **`J7 > 10°`**（严格大于，`=10°` 视为不通过）。
 - 该约束在“点位加载时”和“运行时关键运动后”都会检查。
+- 默认配置已将 `threepoint.min_joint7_deg` 设为 `10.0`；若现场需要放宽，请仅在部署覆盖配置中调整，不要直接修改主配置基线。
 
 ---
 
@@ -102,19 +103,40 @@ sudo udevadm trigger
 默认启动脚本会优先读取 `pipeline_config.yaml`。
 `scripts/unified_config_loader.py` 用于把统一配置分发为运行时参数（动态抓取配置段、视觉 `DABAI_*` 环境变量、机械臂配置段、auto-enable 配置段）。
 
-### 5.2 旧配置兼容（仍可用）
+### 5.2 兼容边界（v2 破坏式说明）
 
-以下文件仍可单独使用：
+以下旧文件仍可单独使用（非视觉参数）：
 
 - `dynamic_grasp_config.yaml`
 - `robot_runtime/config/default.yaml`
 - `robot_runtime/config/auto_enable.yaml`
 
-字段兼容关系：
+兼容关系：
 
 - `route.dump_pre_from` 仍兼容读取为 `route.transport_from`
 - `nero_auto_enable_daemon.py --config` 同时支持统一配置和旧 `auto_enable.yaml`
 - `nero_test_cli.py --config` 同时支持统一配置和旧机械臂配置
+
+不再兼容：
+
+- `pipeline_config.yaml` 的 `vision_runtime` 平铺旧键（flat keys）已废弃，只支持分组结构：`stream/service/publisher/build/detector/geometry/tracking/segmentation/stability/control/rollout`
+- 若历史配置仍是 flat keys，请先执行一次迁移：
+
+```bash
+cd 集成测试
+python3 ./scripts/migrate_pipeline_vision_runtime_v2.py --config ./pipeline_config.yaml --in-place
+```
+
+### 5.3 本次算法重构（v2）更新摘要
+
+- 视觉链路已重构为五阶段：`Detect -> Track -> Segment/Cluster -> Geometry -> GraspStabilize`。
+- 实时主路径不再依赖全局 DBSCAN：改为地面剔除后连通域聚类 + 局部种子区域生长；DBSCAN 仅保留为诊断模式（`segmentation_debug_dbscan`）。
+- 追踪与稳定性统一到单一状态机，输出状态码标准化：`ok/invalid_depth/unstable/too_wide/lost`。
+- 几何阶段增加“质量门控前置 + 早停”，低质量帧会提前终止，避免无效重算慢帧。
+- 视觉 API 已统一为 `schema_version=2`，动态抓取侧仅支持 `v2` 结构。
+- 动态抓取执行循环已改为显式阶段机：`scan -> align -> prepick -> descend -> recover`。
+  `verify` 为可选阶段，默认关闭（`grasp.verify_enabled=false`），避免下探后因相机偏差带来的误失败。
+- 默认灰度开关：`vision_runtime.rollout.vision_pipeline: v2`、`vision_runtime.rollout.dynamic_grasp_api: v2`。
 
 ---
 
@@ -152,6 +174,19 @@ cd 集成测试
 ./scripts/start_vision_arm64.sh --config ./pipeline_config.yaml
 ```
 
+推荐显式指定重构版 `v2`：
+
+```bash
+cd 集成测试
+./scripts/start_vision_arm64.sh --config ./pipeline_config.yaml --pipeline v2
+```
+
+在线确认当前是否为 `v2`：
+
+```bash
+curl -s http://127.0.0.1:18000/api/latest-target | python3 -c 'import sys,json; d=json.load(sys.stdin); print("schema_version=", d.get("schema_version"), "status=", d.get("status"))'
+```
+
 默认面板地址：
 
 ```text
@@ -165,7 +200,15 @@ http://127.0.0.1:18000/
 - 默认仅允许本机访问控制接口（loopback-only，无 token）。
 - 启动参数 `--allow-lan-robot-control` 可放开局域网访问控制接口。
 - 启动参数 `--config` 可显式指定统一配置路径（默认优先 `./pipeline_config.yaml`）。
+- 启动参数 `--pipeline v1|v2` 可显式切换视觉输出主管线。
+- 若同时指定 `--pipeline` 与配置/环境变量，以 `--pipeline` 为准。
+- 启动参数 `--shadow-compare` 会附加 `shadow_compare` 对比摘要，用于灰度观测。
 - 可选环境变量：
+  - `DABAI_VISION_PIPELINE=v1|v2`：视觉输出主管线选择
+  - `DABAI_DYNAMIC_GRASP_API=v2`：动态抓取侧解析版本（仅支持 `v2`）
+  - `DABAI_SHADOW_COMPARE=1|0`：是否附加 v1/v2 对比摘要
+  - `DABAI_METRICS_WINDOW_SIZE=10~600`：窗口统计长度
+  - `DABAI_METRICS_SLOW_FRAME_MS=10~5000`：慢帧阈值（ms）
   - `DABAI_YOLO_MODEL=/abs/path/to/model.engine|/abs/path/to/model.pt`：显式指定模型路径（未设置时，启动脚本会自动优先 `camera_runtime/*.engine`，否则回退到 `camera_runtime/yolo26n.pt`）
   - `DABAI_ROBOT_CONTROL_ENABLED=1|0`：启用/禁用网页控制
   - `DABAI_ROBOT_LOOPBACK_ONLY=1|0`：限制/放开仅本机访问
@@ -259,6 +302,8 @@ cd 集成测试
 
 - 若存在 `./pipeline_config.yaml`，脚本会优先读取其中的 `dynamic_grasp` 配置。
 - 若不存在统一配置，则自动回退到 `dynamic_grasp_config.yaml`。
+- 抓取执行循环已切为显式阶段机：`scan -> align -> prepick -> descend -> recover`。
+- `verify` 为可选阶段，默认 `grasp.verify_enabled=false`（即下探后暂不执行主动验抓，以降低相机偏移导致的误失败）。
 
 常用参数：
 
@@ -334,6 +379,40 @@ PYTHONPATH=./camera_runtime python3 -m pytest camera_runtime/vision_service/test
 cd 集成测试
 python3 validate_nero_handeye_setup.py
 ```
+
+### 9.4 视觉基线采样（稳定性/慢帧）
+
+```bash
+cd 集成测试
+python3 scripts/collect_vision_baseline.py --base-url http://127.0.0.1:18000 --duration-sec 120
+```
+
+关键输出：
+
+- `loss_rate`
+- `invalid_depth_rate`
+- `slow_frame_ratio`
+- `latency_p95_ms`
+
+### 9.5 v1+shadow 与 v2 双采样对比（灰度建议流程）
+
+按同一现场、同一时长做两轮采样，便于对比稳定性与慢帧：
+
+```bash
+cd 集成测试
+./scripts/start_vision_arm64.sh --config ./pipeline_config.yaml --pipeline v1 --shadow-compare
+python3 scripts/collect_vision_baseline.py --base-url http://127.0.0.1:18000 --duration-sec 180 --output ./logs/baseline_v1_shadow.json
+# 结束第一轮后重启服务，再跑第二轮
+./scripts/start_vision_arm64.sh --config ./pipeline_config.yaml --pipeline v2
+python3 scripts/collect_vision_baseline.py --base-url http://127.0.0.1:18000 --duration-sec 180 --output ./logs/baseline_v2.json
+```
+
+建议重点比对：
+
+- `loss_rate`
+- `invalid_depth_rate`
+- `slow_frame_ratio`
+- `latency_p95_ms`
 
 ---
 

@@ -23,18 +23,28 @@ class VisionHealth:
 @dataclass(frozen=True)
 class VisionSnapshot:
     status: str
+    schema_version: int | None
     bbox_xyxy: tuple[int, int, int, int] | None
     grasp_point_optical_m: tuple[float, float, float] | None
     axis_dir_optical: tuple[float, float, float] | None
     target_center_depth_m: float | None
     width_m: float | None
+    tracking_state: str | None
+    tracking_confidence: float | None
+    tracking_reason: str | None
     source_quality_score: float | None
     quality_flags: tuple[str, ...]
     raw: dict[str, Any]
 
     @property
     def is_trackable(self) -> bool:
-        return self.status == "ok" and self.grasp_point_optical_m is not None and self.axis_dir_optical is not None
+        if self.status != "ok":
+            return False
+        if self.grasp_point_optical_m is None or self.axis_dir_optical is None:
+            return False
+        if self.tracking_state is None:
+            return True
+        return self.tracking_state == "locked"
 
     @property
     def quality_ok(self) -> bool:
@@ -47,9 +57,26 @@ class VisionSnapshot:
         return (self.status, self.bbox_xyxy, point)
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "VisionSnapshot":
+    def from_payload(cls, payload: dict[str, Any], *, api_version: str = "v2") -> "VisionSnapshot":
         if not isinstance(payload, dict):
             raise VisionClientError("vision payload must be a JSON object")
+
+        normalized_api_version = str(api_version).strip().lower() or "v2"
+        if normalized_api_version != "v2":
+            raise VisionClientError(f"dynamic grasp vision parser only supports api_version=v2, got {normalized_api_version!r}")
+        return cls._from_payload_v2(payload)
+
+    @classmethod
+    def _from_payload_v2(cls, payload: dict[str, Any]) -> "VisionSnapshot":
+        schema_version_raw = payload.get("schema_version")
+        if schema_version_raw is None:
+            raise VisionClientError("vision v2 payload missing schema_version")
+        try:
+            schema_version = int(schema_version_raw)
+        except (TypeError, ValueError) as exc:
+            raise VisionClientError("vision v2 payload has invalid schema_version") from exc
+        if schema_version != 2:
+            raise VisionClientError(f"vision v2 payload schema_version must be 2, got {schema_version}")
 
         target = payload.get("target")
         bbox_xyxy: tuple[int, int, int, int] | None = None
@@ -79,42 +106,58 @@ class VisionSnapshot:
         if isinstance(size, dict) and size.get("width_mm") is not None:
             width_m = float(size["width_mm"]) / 1000.0
 
+        tracking_state: str | None = None
+        tracking_confidence: float | None = None
+        tracking_reason: str | None = None
+        tracking = payload.get("tracking")
+        if isinstance(tracking, dict):
+            if tracking.get("state") is not None:
+                tracking_state = str(tracking.get("state"))
+            if tracking.get("confidence") is not None:
+                try:
+                    tracking_confidence = float(tracking.get("confidence"))
+                except (TypeError, ValueError):
+                    tracking_confidence = None
+            if tracking.get("reason") is not None:
+                tracking_reason = str(tracking.get("reason"))
+
         source_quality_score: float | None = None
         quality_flags: tuple[str, ...] = ()
-        segmentation = payload.get("segmentation")
-        if isinstance(segmentation, dict):
-            raw_score = segmentation.get("quality_score")
+        quality = payload.get("quality")
+        if isinstance(quality, dict):
+            raw_score = quality.get("score")
             if raw_score is not None:
                 try:
                     source_quality_score = float(raw_score)
                 except (TypeError, ValueError):
                     source_quality_score = None
-            raw_flags = segmentation.get("quality_flags")
+            raw_flags = quality.get("flags")
             if isinstance(raw_flags, list):
                 quality_flags = tuple(str(flag) for flag in raw_flags if str(flag))
-        if source_quality_score is None and isinstance(grasp, dict) and grasp.get("source_quality_score") is not None:
-            try:
-                source_quality_score = float(grasp.get("source_quality_score"))
-            except (TypeError, ValueError):
-                source_quality_score = None
 
         return cls(
             status=str(payload.get("status", "unknown")),
+            schema_version=schema_version,
             bbox_xyxy=bbox_xyxy,
             grasp_point_optical_m=grasp_point,
             axis_dir_optical=axis_dir,
             target_center_depth_m=target_center_depth_m,
             width_m=width_m,
+            tracking_state=tracking_state,
+            tracking_confidence=tracking_confidence,
+            tracking_reason=tracking_reason,
             source_quality_score=source_quality_score,
             quality_flags=quality_flags,
             raw=dict(payload),
         )
 
-
 class VisionClient:
-    def __init__(self, base_url: str, timeout_sec: float) -> None:
+    def __init__(self, base_url: str, timeout_sec: float, api_version: str = "v2") -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout_sec = float(timeout_sec)
+        self._api_version = str(api_version).strip().lower() or "v2"
+        if self._api_version != "v2":
+            raise ValueError(f"dynamic grasp vision client only supports api_version=v2, got {self._api_version!r}")
 
     def _load_json(self, path: str) -> dict[str, Any]:
         url = f"{self._base_url}{path}"
@@ -153,4 +196,4 @@ class VisionClient:
         )
 
     def get_latest_target(self) -> VisionSnapshot:
-        return VisionSnapshot.from_payload(self._load_json("/api/latest-target"))
+        return VisionSnapshot.from_payload(self._load_json("/api/latest-target"), api_version=self._api_version)

@@ -5,6 +5,7 @@ import logging
 import re
 import threading
 import time
+from collections import deque
 from typing import Any
 
 import cv2
@@ -82,6 +83,7 @@ class VisionProcessor:
             "process_threads": None,
         }
         self._process_metrics_cache_ts = 0.0
+        self._window_metrics_history: deque[dict[str, Any]] = deque(maxlen=max(10, int(self._cfg.metrics_window_size)))
 
         self._enable_cuda_benchmark()
         self._warmup_yolo_if_needed()
@@ -162,6 +164,230 @@ class VisionProcessor:
         }
         timing.update(self._read_process_metrics())
         return timing
+
+    def _pipeline_mode(self) -> str:
+        raw_mode = getattr(self._cfg, "vision_pipeline", "v1")
+        mode = str(raw_mode).strip().lower()
+        return mode if mode in {"v1", "v2"} else "v1"
+
+    def _metrics_slow_frame_threshold_ms(self) -> float:
+        raw_threshold = getattr(self._cfg, "metrics_slow_frame_ms", 500.0)
+        try:
+            threshold = float(raw_threshold)
+        except (TypeError, ValueError):
+            threshold = 500.0
+        return max(10.0, threshold)
+
+    def _shadow_compare_enabled(self) -> bool:
+        raw_enabled = getattr(self._cfg, "shadow_compare", False)
+        if isinstance(raw_enabled, bool):
+            return raw_enabled
+        return str(raw_enabled).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _window_metrics_rows(self) -> deque[dict[str, Any]]:
+        history = getattr(self, "_window_metrics_history", None)
+        if isinstance(history, deque):
+            return history
+        raw_size = getattr(self._cfg, "metrics_window_size", 120)
+        try:
+            maxlen = max(10, int(raw_size))
+        except (TypeError, ValueError):
+            maxlen = 120
+        history = deque(maxlen=maxlen)
+        self._window_metrics_history = history
+        return history
+
+    def _record_window_metrics(self, *, status: str, total_ms: float | None) -> dict[str, Any]:
+        normalized_status = str(status).strip().lower() or "unknown"
+        row = {
+            "status": normalized_status,
+            "is_loss": normalized_status in {"lost"},
+            "is_invalid_depth": normalized_status in {"invalid_depth", "unstable"},
+            "total_ms": None if total_ms is None else float(total_ms),
+        }
+        history = self._window_metrics_rows()
+        history.append(row)
+
+        rows = list(history)
+        count = len(rows)
+        if count <= 0:
+            return {
+                "samples": 0,
+                "loss_rate": None,
+                "invalid_depth_rate": None,
+                "slow_frame_ratio": None,
+                "latency_p95_ms": None,
+            }
+
+        loss_count = sum(1 for item in rows if bool(item.get("is_loss")))
+        invalid_depth_count = sum(1 for item in rows if bool(item.get("is_invalid_depth")))
+        latencies = [float(item["total_ms"]) for item in rows if item.get("total_ms") is not None]
+        slow_threshold = self._metrics_slow_frame_threshold_ms()
+        slow_count = sum(1 for value in latencies if float(value) >= slow_threshold)
+        latency_p95_ms = None
+        if latencies:
+            latency_p95_ms = float(np.percentile(np.asarray(latencies, dtype=np.float32), 95))
+
+        return {
+            "samples": int(count),
+            "loss_rate": round(float(loss_count / count), 4),
+            "invalid_depth_rate": round(float(invalid_depth_count / count), 4),
+            "slow_frame_ratio": None if not latencies else round(float(slow_count / len(latencies)), 4),
+            "latency_p95_ms": None if latency_p95_ms is None else round(float(latency_p95_ms), 2),
+        }
+
+    @staticmethod
+    def _normalize_status_v2(raw_status: str, tracking_state: str | None) -> str:
+        status = str(raw_status).strip().lower()
+        if status == "ok":
+            return "ok"
+        if status in {"invalid_depth"}:
+            return "invalid_depth"
+        if status in {"too_wide"}:
+            return "too_wide"
+        if status in {"calibration_mode"}:
+            return "calibration_mode"
+        if status in {"no_target"}:
+            if str(tracking_state or "").strip().lower() in {"acquire"}:
+                return "unstable"
+            return "lost"
+        if status in {"unstable", "lost"}:
+            return status
+        return "unstable"
+
+    def _to_v2_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        target_raw = result.get("target")
+        target = target_raw if isinstance(target_raw, dict) else {}
+        tracking_state = None if target.get("tracker_state") is None else str(target.get("tracker_state"))
+        normalized_status = self._normalize_status_v2(str(result.get("status", "unknown")), tracking_state)
+
+        quality_score = None
+        quality_flags: list[str] = []
+        segmentation = result.get("segmentation")
+        if isinstance(segmentation, dict):
+            raw_score = segmentation.get("quality_score")
+            if raw_score is not None:
+                try:
+                    quality_score = float(raw_score)
+                except (TypeError, ValueError):
+                    quality_score = None
+            raw_flags = segmentation.get("quality_flags")
+            if isinstance(raw_flags, list):
+                quality_flags = [str(flag) for flag in raw_flags if str(flag)]
+
+        timing = result.get("timing")
+        timing_map = timing if isinstance(timing, dict) else {}
+        infer_ms = timing_map.get("infer_ms")
+        if infer_ms is not None:
+            try:
+                infer_ms = float(infer_ms)
+            except (TypeError, ValueError):
+                infer_ms = None
+        geometry_total_ms = timing_map.get("geometry_total_ms")
+        if geometry_total_ms is not None:
+            try:
+                geometry_total_ms = float(geometry_total_ms)
+            except (TypeError, ValueError):
+                geometry_total_ms = None
+        total_ms = None
+        if infer_ms is not None or geometry_total_ms is not None:
+            total_ms = float((infer_ms or 0.0) + (geometry_total_ms or 0.0))
+
+        window_metrics = self._record_window_metrics(status=normalized_status, total_ms=total_ms)
+        metrics = {
+            "frame": {
+                "total_ms": None if total_ms is None else round(float(total_ms), 2),
+                "infer_ms": None if infer_ms is None else round(float(infer_ms), 2),
+                "geometry_total_ms": None if geometry_total_ms is None else round(float(geometry_total_ms), 2),
+                "slow_frame": None if total_ms is None else bool(float(total_ms) >= self._metrics_slow_frame_threshold_ms()),
+            },
+            "window": window_metrics,
+        }
+
+        tracking = {
+            "state": tracking_state,
+            "confidence": None if target.get("tracker_score") is None else float(target.get("tracker_score")),
+            "reason": None if target.get("rejected_reason") is None else str(target.get("rejected_reason")),
+        }
+        if normalized_status == "lost" and tracking["state"] is None:
+            tracking["state"] = "lost"
+
+        return {
+            "schema_version": 2,
+            "status": normalized_status,
+            "target": {
+                "class_id": target.get("class_id"),
+                "class_name": target.get("class_name"),
+                "conf": target.get("conf"),
+                "bbox_xyxy": target.get("bbox_xyxy"),
+            },
+            "tracking": tracking,
+            "depth": result.get("depth"),
+            "size": result.get("size"),
+            "grasp": result.get("grasp"),
+            "segmentation": result.get("segmentation"),
+            "quality": {
+                "score": None if quality_score is None else round(float(quality_score), 3),
+                "flags": quality_flags,
+            },
+            "metrics": metrics,
+            "timing": timing_map,
+        }
+
+    @staticmethod
+    def _build_shadow_compare_summary(
+        *,
+        primary_pipeline: str,
+        v1_result: dict[str, Any],
+        v2_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        primary_mode = str(primary_pipeline).strip().lower()
+        if primary_mode not in {"v1", "v2"}:
+            primary_mode = "v1"
+        v1_status = str(v1_result.get("status", "unknown")).strip().lower() or "unknown"
+        v2_status = str(v2_result.get("status", "unknown")).strip().lower() or "unknown"
+        tracking_v2 = v2_result.get("tracking")
+        quality_v2 = v2_result.get("quality")
+        metrics_v2 = v2_result.get("metrics")
+        return {
+            "enabled": True,
+            "primary_pipeline": primary_mode,
+            "v1": {
+                "status": v1_status,
+            },
+            "v2": {
+                "status": v2_status,
+                "tracking": tracking_v2 if isinstance(tracking_v2, dict) else None,
+                "quality": quality_v2 if isinstance(quality_v2, dict) else None,
+                "metrics": metrics_v2 if isinstance(metrics_v2, dict) else None,
+            },
+            "status_match": bool(v1_status == v2_status),
+        }
+
+    def _finalize_packet_output(self, result: dict[str, Any], annotated: np.ndarray) -> tuple[dict[str, Any], bytes | None]:
+        encoded = self._encode_annotated(annotated)
+        pipeline_mode = self._pipeline_mode()
+        shadow_enabled = self._shadow_compare_enabled()
+        if pipeline_mode == "v2":
+            v2_result = self._to_v2_result(result)
+            if shadow_enabled:
+                v2_result["shadow_compare"] = self._build_shadow_compare_summary(
+                    primary_pipeline="v2",
+                    v1_result=result,
+                    v2_result=v2_result,
+                )
+            return v2_result, encoded
+
+        if shadow_enabled:
+            v2_shadow = self._to_v2_result(result)
+            result_with_shadow = dict(result)
+            result_with_shadow["shadow_compare"] = self._build_shadow_compare_summary(
+                primary_pipeline="v1",
+                v1_result=result,
+                v2_result=v2_shadow,
+            )
+            return result_with_shadow, encoded
+        return result, encoded
 
     def start(self) -> None:
         self._thread.start()
@@ -285,6 +511,7 @@ class VisionProcessor:
         rgb = packet.rgb
         depth = packet.depth
         h, w = rgb.shape[:2]
+        depth_h, depth_w = depth.shape[:2]
 
         calibration_mode_active = False
         if self._calibration_manager is not None:
@@ -305,10 +532,18 @@ class VisionProcessor:
         if fy <= 1.0:
             fy = float(h)
 
-        center_depth_mm = median_depth_at(
-            depth=depth,
+        frame_center_depth_u, frame_center_depth_v = self._map_uv_between_frames(
             u=w // 2,
             v=h // 2,
+            src_width=w,
+            src_height=h,
+            dst_width=depth_w,
+            dst_height=depth_h,
+        )
+        center_depth_mm = median_depth_at(
+            depth=depth,
+            u=frame_center_depth_u,
+            v=frame_center_depth_v,
             depth_scale=depth_scale,
             window=self._cfg.center_depth_window,
             min_depth_mm=self._cfg.min_depth_mm,
@@ -334,18 +569,16 @@ class VisionProcessor:
                 2,
                 cv2.LINE_AA,
             )
-            return (
-                {
-                    "status": "calibration_mode",
-                    "target": None,
-                    "depth": {"center_depth_mm": center_depth_mm},
-                    "size": None,
-                    "grasp": None,
-                    "segmentation": None,
-                    "timing": self._make_timing_payload(meta=meta, fps=fps, infer_ran=False, infer_ms=None),
-                },
-                self._encode_annotated(annotated),
-            )
+            calibration_result = {
+                "status": "calibration_mode",
+                "target": None,
+                "depth": {"center_depth_mm": center_depth_mm},
+                "size": None,
+                "grasp": None,
+                "segmentation": None,
+                "timing": self._make_timing_payload(meta=meta, fps=fps, infer_ran=False, infer_ms=None),
+            }
+            return self._finalize_packet_output(calibration_result, annotated)
 
         self._frame_index += 1
         run_infer = (self._frame_index % self._cfg.infer_every_n == 0) or (not self._cached_detections)
@@ -362,6 +595,8 @@ class VisionProcessor:
             height=h,
             depth=depth,
             depth_scale=depth_scale,
+            depth_width=depth_w,
+            depth_height=depth_h,
         )
 
         result: dict[str, Any] = {
@@ -405,7 +640,7 @@ class VisionProcessor:
                 }
             label = "No target" if not rejected_reason else f"No target ({rejected_reason})"
             cv2.putText(annotated, label, (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 128, 255), 2, cv2.LINE_AA)
-            return result, self._encode_annotated(annotated)
+            return self._finalize_packet_output(result, annotated)
 
         bbox = selected["bbox_xyxy"]
         class_id = int(selected["class_id"])
@@ -413,12 +648,20 @@ class VisionProcessor:
         conf = float(selected["conf"])
         u_center = int((bbox[0] + bbox[2]) / 2)
         v_center = int((bbox[1] + bbox[3]) / 2)
+        u_center_depth, v_center_depth = self._map_uv_between_frames(
+            u=u_center,
+            v=v_center,
+            src_width=w,
+            src_height=h,
+            dst_width=depth_w,
+            dst_height=depth_h,
+        )
         target_center_depth_mm = selected.get("center_depth_mm")
         if target_center_depth_mm is None:
             target_center_depth_mm = median_depth_at(
                 depth=depth,
-                u=u_center,
-                v=v_center,
+                u=u_center_depth,
+                v=v_center_depth,
                 depth_scale=depth_scale,
                 window=self._cfg.center_depth_window,
                 min_depth_mm=self._cfg.min_depth_mm,
@@ -443,16 +686,25 @@ class VisionProcessor:
         result["timing"]["geometry_reused"] = bool(not run_geometry)
 
         if run_geometry:
+            depth_bbox = list(
+                self._map_bbox_between_frames(
+                    bbox=bbox,
+                    src_width=w,
+                    src_height=h,
+                    dst_width=depth_w,
+                    dst_height=depth_h,
+                )
+            )
             geometry_payload, geometry_timing, backend_used = self._run_geometry_with_fallback(
                 depth=depth,
-                bbox=bbox,
+                bbox=depth_bbox,
                 class_id=class_id,
                 depth_scale=depth_scale,
                 fx=fx,
                 fy=fy,
                 cx=cx,
                 cy=cy,
-                ref_uv=(u_center, v_center),
+                ref_uv=(u_center_depth, v_center_depth),
             )
             self._cached_geometry_payload = geometry_payload
             self._cached_geometry_bbox = [int(v) for v in bbox]
@@ -498,7 +750,7 @@ class VisionProcessor:
             result["size"],
             result["grasp"],
         )
-        return result, self._encode_annotated(annotated)
+        return self._finalize_packet_output(result, annotated)
 
     def _run_geometry_with_fallback(
         self,
@@ -788,37 +1040,87 @@ class VisionProcessor:
                     "stats": support_region,
                 }
 
+        seed_region_data: dict[str, Any] | None = None
+        dbscan_region_data: dict[str, Any] | None = None
         t = time.perf_counter()
-        cluster_mask = backend.select_main_cluster(
-            points=object_points,
-            uv=object_uv,
-            ref_uv=(float(ref_uv[0]), float(ref_uv[1])),
-            eps_mm=self._cfg.dbscan_eps_mm,
-            min_samples=self._cfg.dbscan_min_samples,
-        )
-        timings["cluster_ms"] = (time.perf_counter() - t) * 1000.0
-        cluster_points = object_points[cluster_mask]
-        cluster_uv = object_uv[cluster_mask]
-        cluster_stats = {
-            "area_px": int(cluster_points.shape[0]),
-            "density": 1.0,
-            "fill_ratio": float(cluster_points.shape[0] / max(1, (x2 - x1) * (y2 - y1))),
-            "elevated_points": int(cluster_points.shape[0]),
-        }
-        source_options: dict[str, dict[str, Any] | None] = {
-            "support_region": support_region_data,
-            "legacy_cluster": {
+        if self._pipeline_mode() == "v2":
+            seed_region_data = self._build_seed_region_source(
+                points=object_points,
+                uv=object_uv,
+                bbox_xyxy=(x1, y1, x2, y2),
+                ref_uv=(float(ref_uv[0]), float(ref_uv[1])),
+            )
+            if bool(self._cfg.segmentation_debug_dbscan):
+                cluster_mask = backend.select_main_cluster(
+                    points=object_points,
+                    uv=object_uv,
+                    ref_uv=(float(ref_uv[0]), float(ref_uv[1])),
+                    eps_mm=self._cfg.dbscan_eps_mm,
+                    min_samples=self._cfg.dbscan_min_samples,
+                )
+                dbscan_points = object_points[cluster_mask]
+                dbscan_uv = object_uv[cluster_mask]
+                dbscan_region_data = {
+                    "points": dbscan_points,
+                    "uv": dbscan_uv,
+                    "stats": {
+                        "area_px": int(dbscan_points.shape[0]),
+                        "density": 1.0,
+                        "fill_ratio": float(dbscan_points.shape[0] / max(1, (x2 - x1) * (y2 - y1))),
+                        "elevated_points": int(dbscan_points.shape[0]),
+                    },
+                }
+        else:
+            cluster_mask = backend.select_main_cluster(
+                points=object_points,
+                uv=object_uv,
+                ref_uv=(float(ref_uv[0]), float(ref_uv[1])),
+                eps_mm=self._cfg.dbscan_eps_mm,
+                min_samples=self._cfg.dbscan_min_samples,
+            )
+            cluster_points = object_points[cluster_mask]
+            cluster_uv = object_uv[cluster_mask]
+            dbscan_region_data = {
                 "points": cluster_points,
                 "uv": cluster_uv,
-                "stats": cluster_stats,
-            },
+                "stats": {
+                    "area_px": int(cluster_points.shape[0]),
+                    "density": 1.0,
+                    "fill_ratio": float(cluster_points.shape[0] / max(1, (x2 - x1) * (y2 - y1))),
+                    "elevated_points": int(cluster_points.shape[0]),
+                },
+            }
+        timings["cluster_ms"] = (time.perf_counter() - t) * 1000.0
+
+        source_options: dict[str, dict[str, Any] | None] = {
+            "support_region": support_region_data,
+            "seed_region": seed_region_data,
+            "dbscan_debug": dbscan_region_data,
         }
-        candidate_source = "support_region" if support_region_data is not None else "legacy_cluster"
+        if support_region_data is not None:
+            candidate_source = "support_region"
+        elif seed_region_data is not None:
+            candidate_source = "seed_region"
+        else:
+            candidate_source = "dbscan_debug"
         support_source, support_switch_count = self._stabilize_support_source(
             candidate_source=candidate_source,
             source_options=source_options,
         )
-        selected_source = source_options.get(support_source) or source_options.get(candidate_source) or source_options["legacy_cluster"]
+        selected_source = source_options.get(support_source) or source_options.get(candidate_source)
+        if selected_source is None:
+            selected_source = source_options.get("seed_region") or source_options.get("dbscan_debug")
+        if selected_source is None:
+            selected_source = {
+                "points": object_points,
+                "uv": object_uv,
+                "stats": {
+                    "area_px": int(object_points.shape[0]),
+                    "density": 1.0,
+                    "fill_ratio": float(object_points.shape[0] / max(1, (x2 - x1) * (y2 - y1))),
+                    "elevated_points": int(object_points.shape[0]),
+                },
+            }
         assert selected_source is not None
         main_points = selected_source["points"]
         main_uv = selected_source["uv"]
@@ -839,6 +1141,24 @@ class VisionProcessor:
             return finish(
                 self._make_geometry_payload(
                     status="invalid_depth",
+                    size=None,
+                    grasp=None,
+                    segmentation=segmentation,
+                    visualization=visualization,
+                )
+            )
+
+        pre_quality_ok, pre_quality_score, pre_quality_flags = self._evaluate_geometry_quality(
+            segmentation=segmentation,
+            include_axis=False,
+        )
+        if not pre_quality_ok:
+            segmentation["quality_ok"] = False
+            segmentation["quality_score"] = round(float(pre_quality_score), 3)
+            segmentation["quality_flags"] = pre_quality_flags
+            return finish(
+                self._make_geometry_payload(
+                    status="unstable",
                     size=None,
                     grasp=None,
                     segmentation=segmentation,
@@ -919,14 +1239,14 @@ class VisionProcessor:
             "height_mm": round(float(geometry["height_mm"]), 2),
         }
 
-        quality_ok, quality_score, quality_flags = self._evaluate_geometry_quality(segmentation=segmentation)
+        quality_ok, quality_score, quality_flags = self._evaluate_geometry_quality(segmentation=segmentation, include_axis=True)
         segmentation["quality_ok"] = bool(quality_ok)
         segmentation["quality_score"] = round(float(quality_score), 3)
         segmentation["quality_flags"] = quality_flags
         if not quality_ok:
             return finish(
                 self._make_geometry_payload(
-                    status="invalid_depth",
+                    status="unstable",
                     size=size,
                     grasp=None,
                     segmentation=segmentation,
@@ -1185,7 +1505,69 @@ class VisionProcessor:
         }
         return current_source, switch_count
 
-    def _evaluate_geometry_quality(self, segmentation: dict[str, Any]) -> tuple[bool, float, list[str]]:
+    def _build_seed_region_source(
+        self,
+        points: np.ndarray,
+        uv: np.ndarray,
+        bbox_xyxy: tuple[int, int, int, int],
+        ref_uv: tuple[float, float],
+    ) -> dict[str, Any] | None:
+        if points.shape[0] < int(self._cfg.min_object_points):
+            return None
+
+        x1, y1, x2, y2 = bbox_xyxy
+        bbox_area = max(1, int((x2 - x1) * (y2 - y1)))
+        ref_u, ref_v = float(ref_uv[0]), float(ref_uv[1])
+        du = uv[:, 0] - ref_u
+        dv = uv[:, 1] - ref_v
+        dist2 = (du * du) + (dv * dv)
+
+        min_r = max(1, int(self._cfg.seed_region_min_radius_px))
+        max_r = max(min_r, int(self._cfg.seed_region_max_radius_px))
+        step_r = max(1, int(self._cfg.seed_region_radius_step_px))
+        best_mask: np.ndarray | None = None
+        for radius in range(min_r, max_r + 1, step_r):
+            radius2 = float(radius * radius)
+            local_mask = dist2 <= radius2
+            if int(np.count_nonzero(local_mask)) >= int(self._cfg.min_object_points):
+                best_mask = local_mask
+                break
+
+        if best_mask is None:
+            keep_n = min(points.shape[0], max(int(self._cfg.min_object_points), int(self._cfg.support_points_min)))
+            if keep_n <= 0:
+                return None
+            order = np.argpartition(dist2, keep_n - 1)[:keep_n]
+            best_mask = np.zeros(points.shape[0], dtype=bool)
+            best_mask[order] = True
+
+        selected_points = points[best_mask]
+        selected_uv = uv[best_mask]
+        if selected_points.shape[0] < int(self._cfg.min_object_points):
+            return None
+
+        u_vals = selected_uv[:, 0]
+        v_vals = selected_uv[:, 1]
+        u_min = int(np.floor(np.min(u_vals)))
+        u_max = int(np.ceil(np.max(u_vals)))
+        v_min = int(np.floor(np.min(v_vals)))
+        v_max = int(np.ceil(np.max(v_vals)))
+        area_px = max(1, (u_max - u_min + 1) * (v_max - v_min + 1))
+        density = float(selected_points.shape[0] / max(1, area_px))
+        fill_ratio = float(area_px / max(1, bbox_area))
+
+        return {
+            "points": selected_points,
+            "uv": selected_uv,
+            "stats": {
+                "area_px": int(area_px),
+                "density": float(density),
+                "fill_ratio": float(fill_ratio),
+                "elevated_points": int(selected_points.shape[0]),
+            },
+        }
+
+    def _evaluate_geometry_quality(self, segmentation: dict[str, Any], *, include_axis: bool = True) -> tuple[bool, float, list[str]]:
         depth_valid_ratio = float(segmentation.get("depth_valid_ratio", 0.0) or 0.0)
         support_points = int(segmentation.get("support_points", 0) or 0)
         support_fill_ratio = float(segmentation.get("support_fill_ratio", 0.0) or 0.0)
@@ -1202,7 +1584,7 @@ class VisionProcessor:
             quality_flags.append("support_fill_ratio")
         if ground_ratio > float(self._cfg.ground_ratio_max):
             quality_flags.append("ground_ratio")
-        if axis_eig_ratio < float(self._cfg.axis_eig_ratio_min):
+        if include_axis and axis_eig_ratio < float(self._cfg.axis_eig_ratio_min):
             quality_flags.append("axis_eig_ratio")
 
         depth_score = min(1.0, depth_valid_ratio / max(1e-6, float(self._cfg.depth_valid_ratio_min)))
@@ -1216,13 +1598,15 @@ class VisionProcessor:
                 - (ground_ratio - float(self._cfg.ground_ratio_max))
                 / max(0.05, 1.0 - float(self._cfg.ground_ratio_max)),
             )
-        axis_score = min(
-            1.0,
-            max(
-                0.0,
-                (axis_eig_ratio - 1.0) / max(1e-6, float(self._cfg.axis_eig_ratio_min) - 1.0),
-            ),
-        )
+        axis_score = 1.0
+        if include_axis:
+            axis_score = min(
+                1.0,
+                max(
+                    0.0,
+                    (axis_eig_ratio - 1.0) / max(1e-6, float(self._cfg.axis_eig_ratio_min) - 1.0),
+                ),
+            )
         quality_score = max(
             0.0,
             min(1.0, 0.20 * depth_score + 0.20 * support_score + 0.20 * fill_score + 0.20 * ground_score + 0.20 * axis_score),
@@ -1420,9 +1804,16 @@ class VisionProcessor:
         height: int,
         depth: np.ndarray,
         depth_scale: float,
+        depth_width: int | None = None,
+        depth_height: int | None = None,
     ) -> tuple[dict[str, Any] | None, str | None, float | None, str | None]:
         if not detections:
             return self._mark_target_miss(reason="no_detection")
+
+        if depth_width is None or depth_width <= 0:
+            depth_width = int(depth.shape[1])
+        if depth_height is None or depth_height <= 0:
+            depth_height = int(depth.shape[0])
 
         cx = width / 2.0
         cy = height / 2.0
@@ -1431,10 +1822,18 @@ class VisionProcessor:
             bbox = [int(v) for v in det["bbox_xyxy"]]
             ux = float((bbox[0] + bbox[2]) / 2.0)
             vy = float((bbox[1] + bbox[3]) / 2.0)
-            center_depth_mm = median_depth_at(
-                depth=depth,
+            ux_depth, vy_depth = self._map_uv_between_frames(
                 u=int(ux),
                 v=int(vy),
+                src_width=width,
+                src_height=height,
+                dst_width=depth_width,
+                dst_height=depth_height,
+            )
+            center_depth_mm = median_depth_at(
+                depth=depth,
+                u=ux_depth,
+                v=vy_depth,
                 depth_scale=depth_scale,
                 window=self._cfg.center_depth_window,
                 min_depth_mm=self._cfg.min_depth_mm,
@@ -1534,6 +1933,52 @@ class VisionProcessor:
         if state != "locked":
             return None, state, tracker_score, "acquiring_lock"
         return best, state, tracker_score, None
+
+    @staticmethod
+    def _map_uv_between_frames(
+        u: int,
+        v: int,
+        src_width: int,
+        src_height: int,
+        dst_width: int,
+        dst_height: int,
+    ) -> tuple[int, int]:
+        if src_width <= 0 or src_height <= 0 or dst_width <= 0 or dst_height <= 0:
+            return int(u), int(v)
+
+        mapped_u = int(round(((float(u) + 0.5) * float(dst_width) / float(src_width)) - 0.5))
+        mapped_v = int(round(((float(v) + 0.5) * float(dst_height) / float(src_height)) - 0.5))
+        mapped_u = max(0, min(int(dst_width) - 1, mapped_u))
+        mapped_v = max(0, min(int(dst_height) - 1, mapped_v))
+        return mapped_u, mapped_v
+
+    @classmethod
+    def _map_bbox_between_frames(
+        cls,
+        bbox: list[int],
+        src_width: int,
+        src_height: int,
+        dst_width: int,
+        dst_height: int,
+    ) -> tuple[int, int, int, int]:
+        x1, y1, x2, y2 = cls._clamp_bbox(bbox, src_width, src_height)
+        mx1, my1 = cls._map_uv_between_frames(x1, y1, src_width, src_height, dst_width, dst_height)
+        # Use (x2-1, y2-1) so max-edge maps inside frame, then restore exclusive bound.
+        mx2_inclusive, my2_inclusive = cls._map_uv_between_frames(
+            max(x1, x2 - 1),
+            max(y1, y2 - 1),
+            src_width,
+            src_height,
+            dst_width,
+            dst_height,
+        )
+        mx2 = min(dst_width, mx2_inclusive + 1)
+        my2 = min(dst_height, my2_inclusive + 1)
+        if mx2 <= mx1:
+            mx2 = min(dst_width, mx1 + 1)
+        if my2 <= my1:
+            my2 = min(dst_height, my1 + 1)
+        return mx1, my1, mx2, my2
 
     @staticmethod
     def _clamp_bbox(bbox: list[int], width: int, height: int) -> tuple[int, int, int, int]:

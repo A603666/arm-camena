@@ -129,6 +129,14 @@ class WaypointStore:
 
 
 class RealBackend:
+    FATAL_ARM_STATUS_REASONS = {
+        2: "no_solution",
+        3: "singularity",
+        4: "target_angle_limit",
+        5: "joint_communication_exception",
+        7: "collision",
+    }
+
     def __init__(self, cfg: dict, logger: Optional[logging.Logger] = None) -> None:
         self.cfg = cfg
         self.logger = logger if logger is not None else logging.getLogger("nero_test")
@@ -170,9 +178,83 @@ class RealBackend:
             return None
         return None
 
+    @classmethod
+    def _fatal_arm_status_reason(cls, arm_status: Optional[int]) -> Optional[str]:
+        if arm_status is None:
+            return None
+        return cls.FATAL_ARM_STATUS_REASONS.get(int(arm_status))
+
+    def _arm_status_snapshot(self) -> dict[str, Optional[int]]:
+        fields: dict[str, Optional[int]] = {
+            "ctrl_mode": None,
+            "arm_status": None,
+            "mode_feedback": None,
+            "motion_status": None,
+        }
+        if not self.robot or not hasattr(self.robot, "get_arm_status"):
+            return fields
+        try:
+            status = self.robot.get_arm_status()
+            if status is None or not hasattr(status, "msg"):
+                return fields
+            msg = status.msg
+            for key in ("ctrl_mode", "arm_status", "mode_feedback", "motion_status"):
+                raw = getattr(msg, key, None)
+                if raw is None:
+                    continue
+                try:
+                    fields[key] = int(raw)
+                except Exception:
+                    continue
+        except Exception:
+            return fields
+        return fields
+
+    @staticmethod
+    def _format_status_snapshot(snapshot: dict[str, Optional[int]]) -> str:
+        return (
+            f"ctrl_mode={snapshot.get('ctrl_mode')} "
+            f"arm_status={snapshot.get('arm_status')} "
+            f"mode_feedback={snapshot.get('mode_feedback')} "
+            f"motion_status={snapshot.get('motion_status')}"
+        )
+
+    @staticmethod
+    def _format_joint_list_deg(values: Optional[List[float]]) -> str:
+        if values is None:
+            return "N/A"
+        return "[" + ", ".join(f"{math.degrees(float(v)):.2f}" for v in values) + "]"
+
+    @staticmethod
+    def _format_pose_mm_deg(values: Optional[List[float]]) -> str:
+        if values is None:
+            return "N/A"
+        if len(values) != 6:
+            return f"invalid_pose(len={len(values)})"
+        return (
+            f"[x={float(values[0]) * 1000.0:.1f}mm, y={float(values[1]) * 1000.0:.1f}mm, "
+            f"z={float(values[2]) * 1000.0:.1f}mm, rx={math.degrees(float(values[3])):.2f}deg, "
+            f"ry={math.degrees(float(values[4])):.2f}deg, rz={math.degrees(float(values[5])):.2f}deg]"
+        )
+
+    @staticmethod
+    def _resolve_joint_limits_from_cfg(cfg: dict) -> Optional[dict]:
+        raw_limits = cfg.get("joint_limits")
+        if not isinstance(raw_limits, dict):
+            return None
+
+        resolved: dict[str, List[float]] = {}
+        for name in JOINT_NAMES:
+            pair = raw_limits.get(name)
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            resolved[name] = [float(pair[0]), float(pair[1])]
+        return resolved or None
+
     def connect(self) -> bool:
-        if self.connected:
+        if self.connected and self.robot is not None:
             return True
+        self.connected = False
 
         pyagxarm_repo = self.cfg.get("pyagxarm_repo", "")
         if pyagxarm_repo:
@@ -190,18 +272,49 @@ class RealBackend:
             return False
 
         try:
+            joint_limits = self._resolve_joint_limits_from_cfg(self.cfg)
             config = create_agx_arm_config(
                 robot="nero",
                 comm="can",
                 channel=self.cfg.get("can_channel", "can0"),
                 interface=self.cfg.get("can_interface", "socketcan"),
                 bitrate=int(self.cfg.get("can_bitrate", 1000000)),
+                joint_limits=joint_limits,
             )
             self.robot = AgxArmFactory.create_arm(config)
             self.robot.connect()
             if hasattr(self.robot, "set_normal_mode"):
                 self.robot.set_normal_mode()
             self.last_enable_ok = self.enable()
+            if not self.last_enable_ok:
+                self.last_connect_error = "Real backend connect failed: enable() did not succeed"
+                self.logger.error(self.last_connect_error)
+                self.disconnect()
+                return False
+
+            last_flags: Optional[List[bool]] = None
+            for _ in range(60):
+                last_flags = self._get_joint_enable_flags()
+                if isinstance(last_flags, list) and len(last_flags) == 7 and all(last_flags):
+                    break
+                time.sleep(0.05)
+            if not isinstance(last_flags, list) or len(last_flags) != 7:
+                self.last_connect_error = (
+                    "Real backend connect failed: joint enable flags unavailable after enable()"
+                )
+                self.logger.error(self.last_connect_error)
+                self.disconnect()
+                return False
+            if not all(last_flags):
+                rendered = "".join("1" if v else "0" for v in last_flags)
+                self.last_connect_error = (
+                    "Real backend connect failed: not all joints enabled "
+                    f"(joint_enable_flags={rendered})"
+                )
+                self.logger.error(self.last_connect_error)
+                self.disconnect()
+                return False
+
             self.set_speed_percent(self.speed_percent)
 
             effector_symbol = self._resolve_effector_symbol()
@@ -220,10 +333,21 @@ class RealBackend:
         except Exception as exc:
             self.last_connect_error = f"Real backend connect failed: {exc}"
             self.logger.exception(self.last_connect_error)
+            self.disconnect()
             return False
 
     def disconnect(self) -> None:
+        robot = self.robot
+        if robot is not None and hasattr(robot, "disconnect"):
+            try:
+                robot.disconnect()
+            except Exception as exc:
+                self.logger.warning("robot.disconnect() failed: %s", exc)
+        self.robot = None
+        self.effector = None
+        self.effector_init_error = "not_initialized"
         self.connected = False
+        self.last_enable_ok = False
 
     def enable(self) -> bool:
         if not self.robot:
@@ -254,6 +378,35 @@ class RealBackend:
     def _angle_abs_diff_rad(a: float, b: float) -> float:
         return abs(math.atan2(math.sin(float(a) - float(b)), math.cos(float(a) - float(b))))
 
+    @staticmethod
+    def _rpy_to_matrix(roll: float, pitch: float, yaw: float) -> List[List[float]]:
+        cr = math.cos(float(roll))
+        sr = math.sin(float(roll))
+        cp = math.cos(float(pitch))
+        sp = math.sin(float(pitch))
+        cy = math.cos(float(yaw))
+        sy = math.sin(float(yaw))
+        return [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ]
+
+    @classmethod
+    def _rotation_geodesic_rad(cls, lhs_rpy: List[float], rhs_rpy: List[float]) -> float:
+        lhs = cls._rpy_to_matrix(lhs_rpy[0], lhs_rpy[1], lhs_rpy[2])
+        rhs = cls._rpy_to_matrix(rhs_rpy[0], rhs_rpy[1], rhs_rpy[2])
+        rel = [
+            [
+                lhs[0][i] * rhs[0][j] + lhs[1][i] * rhs[1][j] + lhs[2][i] * rhs[2][j]
+                for j in range(3)
+            ]
+            for i in range(3)
+        ]
+        trace = rel[0][0] + rel[1][1] + rel[2][2]
+        cos_theta = max(-1.0, min(1.0, (trace - 1.0) * 0.5))
+        return math.acos(cos_theta)
+
     @classmethod
     def _pose_error(cls, cur: List[float], target: List[float]) -> Tuple[float, float]:
         pos_err = math.sqrt(
@@ -261,11 +414,7 @@ class RealBackend:
             + (float(cur[1]) - float(target[1])) ** 2
             + (float(cur[2]) - float(target[2])) ** 2
         )
-        rot_err = max(
-            cls._angle_abs_diff_rad(cur[3], target[3]),
-            cls._angle_abs_diff_rad(cur[4], target[4]),
-            cls._angle_abs_diff_rad(cur[5], target[5]),
-        )
+        rot_err = cls._rotation_geodesic_rad(cur[3:6], target[3:6])
         return pos_err, rot_err
 
     def _wait_motion_done(
@@ -292,14 +441,15 @@ class RealBackend:
         last_progress_rad: Optional[float] = None
 
         while time.time() < deadline:
-            status_done = False
-            try:
-                status = self.robot.get_arm_status()
-                if status is not None and hasattr(status, "msg"):
-                    motion_status = getattr(status.msg, "motion_status", None)
-                    status_done = motion_status == 0
-            except Exception:
-                pass
+            status_snapshot = self._arm_status_snapshot()
+            status_done = status_snapshot.get("motion_status") == 0
+            fatal_reason = self._fatal_arm_status_reason(status_snapshot.get("arm_status"))
+            if fatal_reason is not None:
+                self.last_move_error = (
+                    f"motion aborted by controller: {fatal_reason} "
+                    f"({self._format_status_snapshot(status_snapshot)})"
+                )
+                return False
 
             if target is None:
                 if status_done:
@@ -369,14 +519,15 @@ class RealBackend:
         last_rot_progress_rad: Optional[float] = None
 
         while time.time() < deadline:
-            status_done = False
-            try:
-                status = self.robot.get_arm_status()
-                if status is not None and hasattr(status, "msg"):
-                    motion_status = getattr(status.msg, "motion_status", None)
-                    status_done = motion_status == 0
-            except Exception:
-                pass
+            status_snapshot = self._arm_status_snapshot()
+            status_done = status_snapshot.get("motion_status") == 0
+            fatal_reason = self._fatal_arm_status_reason(status_snapshot.get("arm_status"))
+            if fatal_reason is not None:
+                self.last_move_error = (
+                    f"motion aborted by controller: {fatal_reason} "
+                    f"({self._format_status_snapshot(status_snapshot)})"
+                )
+                return False
 
             cur_pose = self.get_flange_pose()
             if cur_pose is not None and len(cur_pose) == 6:
@@ -456,18 +607,30 @@ class RealBackend:
         ok = self._wait_motion_done(timeout, target=joints, start=start)
         if not ok and not self.last_move_error:
             cur = self.get_joint_positions()
+            status_snapshot = self._arm_status_snapshot()
             if cur is not None:
                 err_deg = math.degrees(self._max_joint_error(cur, joints))
                 if start is not None:
                     prog_deg = math.degrees(self._max_joint_error(cur, start))
                     self.last_move_error = (
                         f"motion not settled within {timeout:.1f}s "
-                        f"(max_err={err_deg:.2f}deg, progress={prog_deg:.2f}deg)"
+                        f"(max_err={err_deg:.2f}deg, progress={prog_deg:.2f}deg); "
+                        f"status=({self._format_status_snapshot(status_snapshot)}); "
+                        f"current_deg={self._format_joint_list_deg(cur)} "
+                        f"target_deg={self._format_joint_list_deg(joints)}"
                     )
                 else:
-                    self.last_move_error = f"motion not settled within {timeout:.1f}s (max_err={err_deg:.2f}deg)"
+                    self.last_move_error = (
+                        f"motion not settled within {timeout:.1f}s (max_err={err_deg:.2f}deg); "
+                        f"status=({self._format_status_snapshot(status_snapshot)}); "
+                        f"current_deg={self._format_joint_list_deg(cur)} "
+                        f"target_deg={self._format_joint_list_deg(joints)}"
+                    )
             else:
-                self.last_move_error = f"motion not settled within {timeout:.1f}s (no joint feedback)"
+                self.last_move_error = (
+                    f"motion not settled within {timeout:.1f}s (no joint feedback); "
+                    f"status=({self._format_status_snapshot(status_snapshot)})"
+                )
         if not ok:
             self.logger.error("move_joints failed: %s", self.last_move_error)
         return ok
@@ -507,14 +670,23 @@ class RealBackend:
         ok = self._wait_pose_done(timeout, target_pose=pose, start_pose=start_pose)
         if not ok and not self.last_move_error:
             cur_pose = self.get_flange_pose()
+            status_snapshot = self._arm_status_snapshot()
+            cur_joints = self.get_joint_positions()
             if cur_pose is not None and len(cur_pose) == 6:
                 pos_err_m, rot_err_rad = self._pose_error(cur_pose, pose)
                 self.last_move_error = (
                     f"{move_fn_name} motion not settled within {timeout:.1f}s "
-                    f"(pos_err={pos_err_m * 1000.0:.1f}mm, rot_err={math.degrees(rot_err_rad):.2f}deg)"
+                    f"(pos_err={pos_err_m * 1000.0:.1f}mm, rot_err={math.degrees(rot_err_rad):.2f}deg); "
+                    f"status=({self._format_status_snapshot(status_snapshot)}); "
+                    f"current_pose={self._format_pose_mm_deg(cur_pose)} "
+                    f"target_pose={self._format_pose_mm_deg(pose)} "
+                    f"current_joints_deg={self._format_joint_list_deg(cur_joints)}"
                 )
             else:
-                self.last_move_error = f"{move_fn_name} motion not settled within {timeout:.1f}s (no flange feedback)"
+                self.last_move_error = (
+                    f"{move_fn_name} motion not settled within {timeout:.1f}s (no flange feedback); "
+                    f"status=({self._format_status_snapshot(status_snapshot)})"
+                )
         if not ok:
             self.logger.error("move_pose_%s failed: %s", mode, self.last_move_error)
         return ok
@@ -631,6 +803,9 @@ class NeroArmTester:
         self.lock_orientation_from = str(self.threepoint_cfg.get("lock_orientation_from", "pick")).strip().lower() or "pick"
         self.transfer_motion = str(self.threepoint_cfg.get("transfer_motion", "p")).strip().lower() or "p"
         self.approach_motion = str(self.threepoint_cfg.get("approach_motion", "l")).strip().lower() or "l"
+        self.execution_profile = (
+            str(self.threepoint_cfg.get("execution_profile", "joint_first")).strip().lower() or "joint_first"
+        )
         self.orientation_tolerance_deg = float(self.threepoint_cfg.get("orientation_tolerance_deg", 5.0))
         self.orientation_tolerance_rad = math.radians(max(0.1, self.orientation_tolerance_deg))
         self.min_joint7_deg = float(self.threepoint_cfg.get("min_joint7_deg", 30.0))
@@ -643,6 +818,8 @@ class NeroArmTester:
             raise ValueError("threepoint.transfer_motion must be 'p' or 'l'")
         if self.approach_motion not in ("p", "l"):
             raise ValueError("threepoint.approach_motion must be 'p' or 'l'")
+        if self.execution_profile not in ("joint_first", "pose_only"):
+            raise ValueError("threepoint.execution_profile must be 'joint_first' or 'pose_only'")
 
         waypoint_file = Path(self.cfg.get("waypoint_file", cfg_path.parent / "waypoints.yaml"))
         self.store = WaypointStore(waypoint_file)
@@ -1330,7 +1507,8 @@ class NeroArmTester:
         print("backend=real")
         print(
             f"speed_percent={self.speed_percent} max_joint_step_deg={self.max_joint_step_deg:.1f} "
-            f"joint_margin={self.joint_margin:.3f} min_joint7_deg>{self.min_joint7_deg:.1f}"
+            f"joint_margin={self.joint_margin:.3f} min_joint7_deg>{self.min_joint7_deg:.1f} "
+            f"execution_profile={self.execution_profile}"
         )
 
         if joints is None:
@@ -1342,7 +1520,7 @@ class NeroArmTester:
         if pose is None:
             print("flange_pose: N/A")
         else:
-            print("flange_pose(mm/deg):", " ".join(f"{v:+.3f}" for v in pose))
+            print("flange_pose(m/rad):", " ".join(f"{v:+.3f}" for v in pose))
 
         names = self.store.names()
         print("waypoints:", ", ".join(names) if names else "none")
@@ -1466,21 +1644,58 @@ class NeroArmTester:
         print(f"[OK] saved state waypoint: {name}")
         return True
 
-    def _run_threepoint_sequence(self, step_mode: bool) -> bool:
-        self.logger.info(
-            "threepoint sequence start step_mode=%s strict_down=%s transfer=%s approach=%s",
-            step_mode,
-            self.strict_down_enabled,
-            self.transfer_motion,
-            self.approach_motion,
-        )
+    def _move_threepoint_joints(self, name: str, label: str) -> bool:
+        info = self.threepoint_info.get(name, {})
+        joints = info.get("joints_rad")
+        if not isinstance(joints, list) or len(joints) != 7:
+            print(f"[ERR] threepoint.{name}.joints_rad missing")
+            self.logger.error("threepoint joints missing name=%s", name)
+            return False
+        ok = self._move_joints_segmented([float(v) for v in joints], label)
+        if not ok:
+            return False
+        if not self._validate_locked_orientation(label):
+            return False
+        if not self._validate_runtime_joint7(label):
+            return False
+        return True
+
+    def _move_pick_vertical_with_fallback(self) -> bool:
+        if self._move_threepoint_pose("pick", "move pick", "l"):
+            return True
+        context = getattr(self, "_web_override_context", None)
+        if isinstance(context, dict) and bool(context.get("active", False)):
+            delta = context.get("override_pick_vs_static_pick_delta")
+            delta_str = "unknown"
+            if isinstance(delta, list) and len(delta) == 6:
+                delta_str = (
+                    f"x={float(delta[0]) * 1000.0:.1f}mm "
+                    f"y={float(delta[1]) * 1000.0:.1f}mm "
+                    f"z={float(delta[2]) * 1000.0:.1f}mm "
+                    f"rx={math.degrees(float(delta[3])):.2f}deg "
+                    f"ry={math.degrees(float(delta[4])):.2f}deg "
+                    f"rz={math.degrees(float(delta[5])):.2f}deg"
+                )
+            self.logger.warning(
+                "move pick linear failed, fallback to pick joints "
+                "override_active=true override_pick_vs_static_pick_delta=%s",
+                delta_str,
+            )
+        else:
+            self.logger.warning("move pick linear failed, fallback to pick joints")
+        return self._move_threepoint_joints("pick", "move pick joint fallback")
+
+    def _build_threepoint_steps(self) -> List[Tuple[str, Callable[[], bool]]]:
+        profile = str(getattr(self, "execution_profile", "pose_only")).strip().lower() or "pose_only"
+        if profile not in ("joint_first", "pose_only"):
+            profile = "joint_first"
+
         pose_key = self._active_pose_key()
         for name in THREEPOINT_EXEC_ROUTE:
             info = self.threepoint_info.get(name, {})
             pose = info.get(pose_key)
             if not isinstance(pose, list) or len(pose) != 6:
-                print(f"[ERR] missing threepoint pose ({pose_key}): {name}")
-                return False
+                raise ValueError(f"missing threepoint pose ({pose_key}): {name}")
 
         gc = self.cfg.get("gripper", {}) if isinstance(self.cfg.get("gripper", {}), dict) else {}
         open_width = float(gc.get("open_width", 0.05))
@@ -1490,7 +1705,29 @@ class NeroArmTester:
         task = self.cfg.get("task", {}) if isinstance(self.cfg.get("task", {}), dict) else {}
         save_name = str(task.get("save_closed_state_waypoint", "grip_closed_at_pick")).strip() or "grip_closed_at_pick"
 
-        steps: List[Tuple[str, Callable[[], bool]]] = [
+        if profile == "joint_first":
+            return [
+                ("move ready", lambda: self._move_threepoint_joints("ready", "move ready")),
+                ("open gripper (ready)", lambda: self.backend.open_gripper(open_width, force)),
+                ("move prepick", lambda: self._move_threepoint_pose("prepick", "move prepick", "p")),
+                ("move pick", self._move_pick_vertical_with_fallback),
+                ("close gripper", lambda: self.backend.close_gripper(close_width, force)),
+                (f"save closed state {save_name}", lambda: self._save_runtime_state(save_name)),
+                (
+                    "move ready (keep gripper closed)",
+                    lambda: self._move_threepoint_joints("ready", "move ready (keep gripper closed)"),
+                ),
+                (
+                    "move transport (keep gripper closed)",
+                    lambda: self._move_threepoint_joints("transport", "move transport (keep gripper closed)"),
+                ),
+                ("move dump", lambda: self._move_threepoint_joints("dump", "move dump")),
+                ("open gripper (dump)", lambda: self.backend.open_gripper(open_width, force)),
+                ("move transport (return)", lambda: self._move_threepoint_joints("transport", "move transport (return)")),
+                ("move ready (return)", lambda: self._move_threepoint_joints("ready", "move ready (return)")),
+            ]
+
+        return [
             ("move ready", lambda: self._move_threepoint_pose("ready", "move ready", self.transfer_motion)),
             ("open gripper (ready)", lambda: self.backend.open_gripper(open_width, force)),
             ("move prepick", lambda: self._move_threepoint_pose("prepick", "move prepick", "p")),
@@ -1510,6 +1747,23 @@ class NeroArmTester:
             ("move transport (return)", lambda: self._move_threepoint_pose("transport", "move transport (return)", self.transfer_motion)),
             ("move ready (return)", lambda: self._move_threepoint_pose("ready", "move ready (return)", self.transfer_motion)),
         ]
+
+    def _run_threepoint_sequence(self, step_mode: bool) -> bool:
+        profile = str(getattr(self, "execution_profile", "pose_only")).strip().lower() or "pose_only"
+        self.logger.info(
+            "threepoint sequence start step_mode=%s strict_down=%s transfer=%s approach=%s execution_profile=%s",
+            step_mode,
+            bool(getattr(self, "strict_down_enabled", False)),
+            str(getattr(self, "transfer_motion", "p")),
+            str(getattr(self, "approach_motion", "l")),
+            profile,
+        )
+        try:
+            steps = self._build_threepoint_steps()
+        except Exception as exc:
+            print(f"[ERR] {exc}")
+            self.logger.error("threepoint step build failed: %s", exc)
+            return False
 
         ok = self._run_steps(steps, step_mode)
         if ok:

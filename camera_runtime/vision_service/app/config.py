@@ -7,6 +7,8 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class AppConfig:
+    vision_pipeline: str
+    shadow_compare: bool
     zmq_endpoint: str
     zmq_topic: str
     zmq_timeout_ms: int
@@ -44,6 +46,10 @@ class AppConfig:
     grasp_window_min_points: int
     object_height_min_mm: float
     support_close_px: int
+    segmentation_debug_dbscan: bool
+    seed_region_min_radius_px: int
+    seed_region_max_radius_px: int
+    seed_region_radius_step_px: int
     axis_eig_ratio_min: float
     axis_hold_frames: int
     axis_smooth_alpha: float
@@ -66,6 +72,8 @@ class AppConfig:
     grasp_jump_yaw_deg: float
     annotated_jpeg_quality: int
     stale_frame_threshold_sec: float
+    metrics_window_size: int
+    metrics_slow_frame_ms: float
     robot_control_enabled: bool
     robot_arm_config_path: Path
     robot_backend_override: str | None
@@ -131,6 +139,8 @@ def load_config() -> AppConfig:
     backend_override = backend_override_raw if backend_override_raw else None
 
     return AppConfig(
+        vision_pipeline=_get_env_choice("DABAI_VISION_PIPELINE", "v1", {"v1", "v2"}),
+        shadow_compare=_get_env_bool("DABAI_SHADOW_COMPARE", False),
         zmq_endpoint=os.getenv("DABAI_SUB_ENDPOINT", "tcp://127.0.0.1:5557"),
         zmq_topic=os.getenv("DABAI_SUB_TOPIC", "frames.rgbd.v1"),
         zmq_timeout_ms=max(50, min(500, _get_env_int("DABAI_SUB_TIMEOUT_MS", 120))),
@@ -168,6 +178,10 @@ def load_config() -> AppConfig:
         grasp_window_min_points=max(20, _get_env_int("DABAI_GRASP_WINDOW_MIN_POINTS", 80)),
         object_height_min_mm=max(1.0, _get_env_float("DABAI_OBJECT_HEIGHT_MIN_MM", 4.0)),
         support_close_px=max(1, min(31, _get_env_int("DABAI_SUPPORT_CLOSE_PX", 5))),
+        segmentation_debug_dbscan=_get_env_bool("DABAI_SEGMENTATION_DEBUG_DBSCAN", False),
+        seed_region_min_radius_px=max(2, min(120, _get_env_int("DABAI_SEED_REGION_MIN_RADIUS_PX", 8))),
+        seed_region_max_radius_px=max(8, min(400, _get_env_int("DABAI_SEED_REGION_MAX_RADIUS_PX", 140))),
+        seed_region_radius_step_px=max(1, min(80, _get_env_int("DABAI_SEED_REGION_RADIUS_STEP_PX", 8))),
         axis_eig_ratio_min=max(1.01, _get_env_float("DABAI_AXIS_EIG_RATIO_MIN", 1.35)),
         axis_hold_frames=max(0, min(60, _get_env_int("DABAI_AXIS_HOLD_FRAMES", 5))),
         axis_smooth_alpha=max(0.0, min(1.0, _get_env_float("DABAI_AXIS_SMOOTH_ALPHA", 0.25))),
@@ -190,6 +204,8 @@ def load_config() -> AppConfig:
         grasp_jump_yaw_deg=max(1.0, min(180.0, _get_env_float("DABAI_GRASP_JUMP_YAW_DEG", 20.0))),
         annotated_jpeg_quality=max(50, min(95, _get_env_int("DABAI_ANNOTATED_JPEG_QUALITY", 85))),
         stale_frame_threshold_sec=max(0.2, _get_env_float("DABAI_STALE_FRAME_SEC", 2.0)),
+        metrics_window_size=max(10, min(600, _get_env_int("DABAI_METRICS_WINDOW_SIZE", 120))),
+        metrics_slow_frame_ms=max(10.0, min(5000.0, _get_env_float("DABAI_METRICS_SLOW_FRAME_MS", 500.0))),
         robot_control_enabled=_get_env_bool("DABAI_ROBOT_CONTROL_ENABLED", True),
         robot_arm_config_path=configured_robot_cfg,
         robot_backend_override=backend_override,

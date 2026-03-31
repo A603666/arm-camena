@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import math
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +30,16 @@ def _load_python_module(module_name: str, module_path: Path) -> ModuleType:
     if spec is None or spec.loader is None:
         raise RuntimeError(f"unable to load python module from {module_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    previous_module = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        if previous_module is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous_module
+        raise
     return module
 
 
@@ -53,6 +63,33 @@ def _load_arm_config(path: Path) -> dict[str, Any]:
             if not candidate.is_absolute():
                 can_tools["scripts_dir"] = str((path.parent / candidate).resolve())
     return raw
+
+
+def _resolve_nero_cli_module_path(arm_config_path: Path) -> Path:
+    arm_config_path = Path(arm_config_path).expanduser().resolve()
+    candidates = [
+        arm_config_path.parent.parent / "nero_test_cli.py",
+        arm_config_path.parent / "robot_runtime" / "nero_test_cli.py",
+        arm_config_path.parent / "nero_test_cli.py",
+        Path(__file__).resolve().parents[1] / "robot_runtime" / "nero_test_cli.py",
+    ]
+    seen: set[str] = set()
+    ordered_candidates: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered_candidates.append(resolved)
+        if resolved.is_file():
+            return resolved
+
+    rendered = "\n".join(f"- {path}" for path in ordered_candidates)
+    raise FileNotFoundError(
+        "nero_test_cli.py not found for arm config "
+        f"{arm_config_path}\nsearched candidates:\n{rendered}"
+    )
 
 
 def _pose_map_to_list(raw: Any) -> list[float]:
@@ -157,7 +194,7 @@ class RobotBridge:
         self.logger = logger
         self._move_timeout_sec = float(move_timeout_sec)
         self._tcp_offset_pose: list[float] | None = None
-        module_path = self.arm_config_path.parent.parent / "nero_test_cli.py"
+        module_path = _resolve_nero_cli_module_path(self.arm_config_path)
         self._module = _load_python_module("nero_test_cli_dynamic_bridge", module_path)
         self._backend = self._module.RealBackend(self.arm_cfg, logger)
         self._route = build_static_route(self.arm_cfg)

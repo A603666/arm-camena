@@ -18,6 +18,9 @@ publisher_pid=""
 service_pid=""
 cleanup_done=0
 using_unified_config=false
+auto_enable_service_name="nero-auto-enable.service"
+auto_enable_service_was_active=0
+auto_enable_service_paused=0
 
 require_command() {
     local cmd="$1"
@@ -33,6 +36,32 @@ is_positive_int() {
 
 is_nonnegative_number() {
     [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+ensure_sudo_session() {
+    if [[ "${EUID}" -eq 0 ]]; then
+        return 0
+    fi
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "[vision] missing command: sudo" >&2
+        return 1
+    fi
+    if ! sudo -v; then
+        echo "[vision] sudo auth failed" >&2
+        return 1
+    fi
+    return 0
+}
+
+run_systemctl_with_privilege() {
+    local action="$1"
+    local unit="$2"
+    if [[ "${EUID}" -eq 0 ]]; then
+        systemctl "${action}" "${unit}"
+    else
+        ensure_sudo_session || return 1
+        sudo systemctl "${action}" "${unit}"
+    fi
 }
 
 load_unified_vision_env_if_needed() {
@@ -87,6 +116,62 @@ resolve_auto_enable_config_for_daemon() {
     printf '%s\n' "${fallback_config}"
 }
 
+pause_auto_enable_daemon_for_exclusive_control() {
+    if [[ "${DABAI_ROBOT_CONTROL_ENABLED}" != "1" ]]; then
+        export DABAI_ROBOT_EXCLUSIVE_CONTROL="${DABAI_ROBOT_EXCLUSIVE_CONTROL:-0}"
+        return 0
+    fi
+
+    export DABAI_ROBOT_EXCLUSIVE_CONTROL="0"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "[vision] systemctl not available; skip daemon isolation and keep non-exclusive robot control."
+        return 0
+    fi
+
+    if ! systemctl is-active --quiet "${auto_enable_service_name}"; then
+        export DABAI_ROBOT_EXCLUSIVE_CONTROL="1"
+        return 0
+    fi
+
+    auto_enable_service_was_active=1
+    echo "[vision] ${auto_enable_service_name} is active; stopping for exclusive robot control..."
+    if ! run_systemctl_with_privilege stop "${auto_enable_service_name}"; then
+        echo "[vision] failed to stop ${auto_enable_service_name}; abort to avoid control conflict." >&2
+        exit 1
+    fi
+    if systemctl is-active --quiet "${auto_enable_service_name}"; then
+        echo "[vision] ${auto_enable_service_name} is still active after stop; abort to avoid control conflict." >&2
+        exit 1
+    fi
+
+    auto_enable_service_paused=1
+    export DABAI_ROBOT_EXCLUSIVE_CONTROL="1"
+    echo "[vision] ${auto_enable_service_name} paused; exclusive robot control enabled for this session."
+}
+
+restore_auto_enable_daemon_if_needed() {
+    if [[ "${auto_enable_service_paused}" != "1" ]]; then
+        return 0
+    fi
+    auto_enable_service_paused=0
+
+    if [[ "${auto_enable_service_was_active}" != "1" ]]; then
+        return 0
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "[vision] WARNING: cannot restore ${auto_enable_service_name} (systemctl missing)." >&2
+        return 0
+    fi
+
+    echo "[vision] restoring ${auto_enable_service_name}..."
+    if run_systemctl_with_privilege start "${auto_enable_service_name}"; then
+        echo "[vision] restored ${auto_enable_service_name}."
+    else
+        echo "[vision] WARNING: failed to restore ${auto_enable_service_name}; please start it manually." >&2
+    fi
+}
+
 prepare_robot_can() {
     local daemon_path="${ROOT_DIR}/robot_runtime/nero_auto_enable_daemon.py"
     local daemon_config=""
@@ -112,11 +197,6 @@ prepare_robot_can() {
         exit 1
     fi
 
-    if ! command -v sudo >/dev/null 2>&1; then
-        echo "[vision] missing command: sudo" >&2
-        exit 1
-    fi
-
     echo "[vision] prepare robot can..."
     echo "[vision] auto-enable config: ${daemon_config}"
 
@@ -130,17 +210,19 @@ prepare_robot_can() {
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-active --quiet nero-auto-enable.service; then
-            echo "[vision] nero-auto-enable.service is active; skip local --once auto-enable to avoid CAN controller conflict."
+        if systemctl is-active --quiet "${auto_enable_service_name}"; then
+            if [[ "${DABAI_ROBOT_EXCLUSIVE_CONTROL:-0}" == "1" ]]; then
+                echo "[vision] ${auto_enable_service_name} is active while exclusive robot control is requested; abort." >&2
+                exit 1
+            fi
+            echo "[vision] ${auto_enable_service_name} is active; skip local --once auto-enable to avoid CAN controller conflict."
             return 0
         fi
     fi
 
-    if [[ "${EUID}" -ne 0 ]]; then
-        if ! sudo -v; then
-            echo "[vision] auto-enable once failed: sudo auth failed" >&2
-            exit 1
-        fi
+    if ! ensure_sudo_session; then
+        echo "[vision] auto-enable once failed: sudo unavailable" >&2
+        exit 1
     fi
 
     while (( attempt <= max_attempts )); do
@@ -238,6 +320,7 @@ on_exit() {
     local code="$?"
     trap - EXIT INT TERM HUP QUIT
     cleanup_children
+    restore_auto_enable_daemon_if_needed || true
     return "${code}"
 }
 
@@ -330,12 +413,29 @@ terminate_stale_processes() {
 
 check_only=false
 allow_lan_robot_control=false
+shadow_compare=false
+pipeline_override=""
 config_path="${DEFAULT_UNIFIED_CONFIG}"
 config_provided=false
 while (( "$#" > 0 )); do
     case "$1" in
         --check)
             check_only=true
+            ;;
+        --pipeline)
+            if (( "$#" < 2 )); then
+                echo "[vision] --pipeline requires v1 or v2" >&2
+                exit 2
+            fi
+            pipeline_override="$(echo "$2" | tr '[:upper:]' '[:lower:]')"
+            if [[ "${pipeline_override}" != "v1" && "${pipeline_override}" != "v2" ]]; then
+                echo "[vision] --pipeline must be v1 or v2 (got: $2)" >&2
+                exit 2
+            fi
+            shift
+            ;;
+        --shadow-compare)
+            shadow_compare=true
             ;;
         --allow-lan-robot-control)
             allow_lan_robot_control=true
@@ -351,9 +451,11 @@ while (( "$#" > 0 )); do
             ;;
         -h|--help)
             cat <<'EOF'
-Usage: ./scripts/start_vision_arm64.sh [--check] [--allow-lan-robot-control] [--config PATH]
+Usage: ./scripts/start_vision_arm64.sh [--check] [--pipeline v1|v2] [--shadow-compare] [--allow-lan-robot-control] [--config PATH]
 
   --check                      Check dependencies and resolved runtime config only.
+  --pipeline v1|v2             Select vision pipeline version (env: DABAI_VISION_PIPELINE).
+  --shadow-compare             Enable shadow compare mode for pipeline diagnostics.
   --allow-lan-robot-control    Allow robot control API access from LAN clients.
   --config PATH                Config path (default: ./pipeline_config.yaml if present).
 EOF
@@ -361,7 +463,7 @@ EOF
             ;;
         *)
             echo "[vision] unknown argument: $1" >&2
-            echo "[vision] supported arguments: --check, --allow-lan-robot-control, --config PATH" >&2
+            echo "[vision] supported arguments: --check, --pipeline v1|v2, --shadow-compare, --allow-lan-robot-control, --config PATH" >&2
             exit 2
             ;;
     esac
@@ -454,6 +556,12 @@ then
 fi
 
 load_unified_vision_env_if_needed "${config_path}"
+if [[ -n "${pipeline_override}" ]]; then
+    export DABAI_VISION_PIPELINE="${pipeline_override}"
+fi
+if [[ "${shadow_compare}" == "true" ]]; then
+    export DABAI_SHADOW_COMPARE="1"
+fi
 
 selected_model="${DABAI_YOLO_MODEL:-}"
 if [[ -z "${selected_model}" ]]; then
@@ -477,6 +585,8 @@ export DABAI_YOLO_IMGSZ="${DABAI_YOLO_IMGSZ:-512}"
 export DABAI_YOLO_PRECISION="${DABAI_YOLO_PRECISION:-fp32}"
 export DABAI_YOLO_WARMUP="${DABAI_YOLO_WARMUP:-1}"
 export DABAI_GEOM_BACKEND="${DABAI_GEOM_BACKEND:-cpu}"
+export DABAI_VISION_PIPELINE="${DABAI_VISION_PIPELINE:-v2}"
+export DABAI_SHADOW_COMPARE="${DABAI_SHADOW_COMPARE:-0}"
 export DABAI_GEOM_PARITY_CHECK="${DABAI_GEOM_PARITY_CHECK:-0}"
 export DABAI_GEOM_PARITY_EVERY_N="${DABAI_GEOM_PARITY_EVERY_N:-30}"
 export DABAI_INFER_EVERY_N="${DABAI_INFER_EVERY_N:-2}"
@@ -489,7 +599,7 @@ export DABAI_GROUND_FIT_FAST_MIN_INLIER_RATIO="${DABAI_GROUND_FIT_FAST_MIN_INLIE
 export DABAI_GROUND_FIT_FAST_MIN_INLIERS="${DABAI_GROUND_FIT_FAST_MIN_INLIERS:-80}"
 export DABAI_COLOR_FPS="${DABAI_COLOR_FPS:-15}"
 export DABAI_DEPTH_FPS="${DABAI_DEPTH_FPS:-30}"
-export DABAI_ALIGN_MODE="${DABAI_ALIGN_MODE:-disable}"
+export DABAI_ALIGN_MODE="${DABAI_ALIGN_MODE:-auto}"
 export DABAI_FRAME_SYNC="${DABAI_FRAME_SYNC:-0}"
 export DABAI_OB_LOG_LEVEL="${DABAI_OB_LOG_LEVEL:-error}"
 export DABAI_UVICORN_LOG_LEVEL="${DABAI_UVICORN_LOG_LEVEL:-warning}"
@@ -516,6 +626,7 @@ export DABAI_GRASP_JUMP_YAW_DEG="${DABAI_GRASP_JUMP_YAW_DEG:-20}"
 export DABAI_ROBOT_CONTROL_ENABLED="${DABAI_ROBOT_CONTROL_ENABLED:-1}"
 export DABAI_AUTO_ENABLE_ONCE_MAX_ATTEMPTS="${DABAI_AUTO_ENABLE_ONCE_MAX_ATTEMPTS:-3}"
 export DABAI_AUTO_ENABLE_ONCE_RETRY_DELAY_SEC="${DABAI_AUTO_ENABLE_ONCE_RETRY_DELAY_SEC:-2.0}"
+export DABAI_ROBOT_EXCLUSIVE_CONTROL="${DABAI_ROBOT_EXCLUSIVE_CONTROL:-0}"
 robot_loopback_only="${DABAI_ROBOT_LOOPBACK_ONLY:-1}"
 if [[ "${allow_lan_robot_control}" == "true" ]]; then
     robot_loopback_only="0"
@@ -560,6 +671,8 @@ if [[ "${check_only}" == "true" ]]; then
     echo "  yolo_imgsz=${DABAI_YOLO_IMGSZ}"
     echo "  yolo_precision=${DABAI_YOLO_PRECISION}"
     echo "  geom_backend=${DABAI_GEOM_BACKEND}"
+    echo "  vision_pipeline=${DABAI_VISION_PIPELINE}"
+    echo "  shadow_compare=${DABAI_SHADOW_COMPARE}"
     echo "  geom_parity_check=${DABAI_GEOM_PARITY_CHECK}"
     echo "  geom_parity_every_n=${DABAI_GEOM_PARITY_EVERY_N}"
     echo "  infer_every_n=${DABAI_INFER_EVERY_N}"
@@ -600,11 +713,13 @@ if [[ "${check_only}" == "true" ]]; then
     echo "  auto_enable_once_max_attempts=${DABAI_AUTO_ENABLE_ONCE_MAX_ATTEMPTS}"
     echo "  auto_enable_once_retry_delay_sec=${DABAI_AUTO_ENABLE_ONCE_RETRY_DELAY_SEC}"
     echo "  robot_loopback_only=${DABAI_ROBOT_LOOPBACK_ONLY}"
+    echo "  robot_exclusive_control=${DABAI_ROBOT_EXCLUSIVE_CONTROL}"
     echo "  robot_config=${DABAI_ROBOT_CONFIG}"
     exit 0
 fi
 
 terminate_stale_processes
+pause_auto_enable_daemon_for_exclusive_control
 prepare_robot_can
 
 build_jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"

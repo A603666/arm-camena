@@ -42,11 +42,15 @@ def make_snapshot(
     axis = None if status != "ok" else axis_dir
     return VisionSnapshot(
         status=status,
+        schema_version=2 if status == "ok" else 2,
         bbox_xyxy=(100, 100, 200, 200) if status == "ok" else None,
         grasp_point_optical_m=grasp_point,
         axis_dir_optical=axis,
         target_center_depth_m=z_mm / 1000.0 if status == "ok" else None,
         width_m=0.03 if status == "ok" else None,
+        tracking_state="locked" if status == "ok" else "lost",
+        tracking_confidence=0.8 if status == "ok" else 0.0,
+        tracking_reason=None if status == "ok" else "no_target",
         source_quality_score=quality_score if status == "ok" else None,
         quality_flags=quality_flags if status == "ok" else (),
         raw=(
@@ -199,6 +203,7 @@ def make_config(*, plan_buffer_frames: int = 3, max_replan_jump_mm: float = 2000
         config_path=Path("/tmp/dynamic_grasp_test.yaml"),
         vision=VisionConfig(
             base_url="http://mock",
+            api_version="v2",
             poll_hz=50.0,
             health_timeout_sec=0.1,
             target_stable_frames=1,
@@ -216,6 +221,7 @@ def make_config(*, plan_buffer_frames: int = 3, max_replan_jump_mm: float = 2000
             open_width_m=0.05,
             close_width_m=0.0,
             force_n=1.0,
+            verify_enabled=False,
             prepick_offset_m=0.05,
             final_z_offset_m=0.0,
             max_descent_m=0.35,
@@ -283,7 +289,7 @@ class DynamicGraspControllerTests(unittest.TestCase):
         self.assertGreaterEqual(len(transport_moves), 2)
         self.assertIn(("move_flange_p", tuple(round(v, 4) for v in robot.ready_pose)), robot.actions)
 
-    def test_failed_grasp_does_not_enter_dump_route(self) -> None:
+    def test_failed_grasp_without_verification_still_enters_dump_route(self) -> None:
         robot = FakeRobot(verified_width=0.0)
         centered = make_snapshot(x_mm=0.5, y_mm=0.5)
         vision = FakeVisionClient(
@@ -292,6 +298,38 @@ class DynamicGraspControllerTests(unittest.TestCase):
             ]
         )
         controller = self._make_controller(robot, vision)
+        success = controller.execute_cycle(make_snapshot(x_mm=18.0, y_mm=10.0))
+        self.assertTrue(success)
+        self.assertIn(("close", 0.0, 1.0), robot.actions)
+        self.assertIn(("move_flange_p", tuple(round(v, 4) for v in robot.transport_pose)), robot.actions)
+
+    def test_failed_grasp_with_verification_enabled_does_not_enter_dump_route(self) -> None:
+        robot = FakeRobot(verified_width=0.0)
+        centered = make_snapshot(x_mm=0.5, y_mm=0.5)
+        vision = FakeVisionClient([*([centered] * 12)])
+        config = make_config()
+        config = AppConfig(
+            config_path=config.config_path,
+            vision=config.vision,
+            handeye=config.handeye,
+            scan=config.scan,
+            grasp=GraspConfig(
+                open_width_m=config.grasp.open_width_m,
+                close_width_m=config.grasp.close_width_m,
+                force_n=config.grasp.force_n,
+                verify_enabled=True,
+                prepick_offset_m=config.grasp.prepick_offset_m,
+                final_z_offset_m=config.grasp.final_z_offset_m,
+                max_descent_m=config.grasp.max_descent_m,
+                min_safe_z_m=config.grasp.min_safe_z_m,
+                yaw_alignment_offset_deg=config.grasp.yaw_alignment_offset_deg,
+                verify_width_range_m=config.grasp.verify_width_range_m,
+                verify_timeout_sec=config.grasp.verify_timeout_sec,
+            ),
+            route=config.route,
+            runtime=config.runtime,
+        )
+        controller = self._make_controller(robot, vision, config=config)
         success = controller.execute_cycle(make_snapshot(x_mm=18.0, y_mm=10.0))
         self.assertFalse(success)
         self.assertIn(("close", 0.0, 1.0), robot.actions)
@@ -440,6 +478,24 @@ class DynamicGraspControllerTests(unittest.TestCase):
         success = controller.execute_cycle(make_snapshot(x_mm=12.0, y_mm=8.0))
         self.assertFalse(success)
         self.assertNotIn(("move_flange_l", tuple(round(v, 4) for v in robot.dump_pose)), robot.actions)
+
+    def test_recover_to_ready_returns_false_when_linear_lift_fails(self) -> None:
+        robot = FakeRobot()
+        vision = FakeVisionClient([])
+        controller = self._make_controller(robot, vision)
+        robot.current_tcp = [0.0, 0.0, 0.20, 0.0, 0.0, 0.0]
+        controller.ready_tcp_pose = [0.0, 0.0, 0.40, 0.0, 0.0, 0.0]
+
+        def _fail_lift(pose) -> bool:
+            robot.current_tcp = list(pose)
+            robot.current_flange = list(pose)
+            robot.actions.append(("move_tcp_l", tuple(round(v, 4) for v in pose)))
+            return False
+
+        robot.move_tcp_l = _fail_lift  # type: ignore[assignment]
+        ok = controller._recover_to_ready("unit test failure path")
+        self.assertFalse(ok)
+        self.assertFalse(any(action[0] == "move_flange_p" for action in robot.actions))
 
 
 if __name__ == "__main__":
