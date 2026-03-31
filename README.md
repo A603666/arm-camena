@@ -178,7 +178,7 @@ cd 集成测试
 
 ```bash
 cd 集成测试
-./scripts/start_vision_arm64.sh --config ./pipeline_config.yaml --pipeline v2
+./scripts/start_vision_arm64.sh --config ./pipeline_config.yaml --pipeline v2 --allow-lan-robot-control
 ```
 
 在线确认当前是否为 `v2`：
